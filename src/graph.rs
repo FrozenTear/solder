@@ -33,6 +33,12 @@ pub enum GraphMessage {
     Undo,
     Redo,
     ToggleHelp,
+    // Search
+    SearchActivate,
+    SearchInput { text: String },
+    SearchBackspace,
+    SearchClear,
+    SearchCommit,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +274,61 @@ impl Graph {
             GraphMessage::ToggleHelp => {
                 self.show_help = !self.show_help;
                 self.cache.clear();
+            }
+            GraphMessage::SearchActivate => {
+                self.search_active = true;
+                self.search_query.clear();
+                self.filtered_nodes.clear();
+                self.cache.clear();
+            }
+            GraphMessage::SearchInput { text } => {
+                self.search_active = true;
+                self.search_query.push_str(&text);
+                self.update_search_filter();
+                self.cache.clear();
+            }
+            GraphMessage::SearchBackspace => {
+                self.search_query.pop();
+                self.update_search_filter();
+                self.cache.clear();
+            }
+            GraphMessage::SearchClear => {
+                self.search_active = false;
+                self.search_query.clear();
+                self.filtered_nodes.clear();
+                self.cache.clear();
+            }
+            GraphMessage::SearchCommit => {
+                // Focus on first matching node
+                if let Some(&node_id) = self.filtered_nodes.iter().next() {
+                    if let Some(node) = self.nodes.get(&node_id) {
+                        // Pan to center the node
+                        self.pan_offset = Vector::new(
+                            -node.position.x * self.zoom + 400.0,
+                            -node.position.y * self.zoom + 300.0,
+                        );
+                    }
+                }
+                self.search_active = false;
+                self.search_query.clear();
+                self.filtered_nodes.clear();
+                self.cache.clear();
+            }
+        }
+    }
+
+    /// Update the filtered nodes based on search query
+    fn update_search_filter(&mut self) {
+        self.filtered_nodes.clear();
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        let query_lower = self.search_query.to_lowercase();
+        for (&id, node) in &self.nodes {
+            let display_name = node.custom_name.as_ref().unwrap_or(&node.name);
+            if display_name.to_lowercase().contains(&query_lower) {
+                self.filtered_nodes.insert(id);
             }
         }
     }
@@ -944,7 +1005,10 @@ impl canvas::Program<Message> for Graph {
 
             // Draw nodes
             for node in self.nodes.values() {
-                draw_node(frame, node);
+                // Dim nodes that don't match search filter
+                let dimmed = self.search_active && !self.search_query.is_empty()
+                    && !self.filtered_nodes.contains(&node.id);
+                draw_node(frame, node, dimmed);
             }
         });
 
@@ -987,7 +1051,16 @@ impl canvas::Program<Message> for Graph {
             Frame::new(renderer, bounds.size()).into_geometry()
         };
 
-        vec![content, pending_geo, help_geo]
+        // Search overlay
+        let search_geo = if self.search_active {
+            let mut frame = Frame::new(renderer, bounds.size());
+            draw_search_overlay(&mut frame, bounds.size(), &self.search_query, self.filtered_nodes.len());
+            frame.into_geometry()
+        } else {
+            Frame::new(renderer, bounds.size()).into_geometry()
+        };
+
+        vec![content, pending_geo, help_geo, search_geo]
     }
 
     fn update(
@@ -1099,9 +1172,48 @@ impl canvas::Program<Message> for Graph {
                 }
                 _ => None,
             },
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
                 use iced::keyboard::Key;
+
+                // When search is active, handle typing
+                if self.search_active {
+                    match key.as_ref() {
+                        Key::Named(iced::keyboard::key::Named::Escape) => {
+                            return Some(canvas::Action::publish(Message::Graph(GraphMessage::SearchClear)));
+                        }
+                        Key::Named(iced::keyboard::key::Named::Backspace) => {
+                            return Some(canvas::Action::publish(Message::Graph(GraphMessage::SearchBackspace)));
+                        }
+                        Key::Named(iced::keyboard::key::Named::Enter) => {
+                            return Some(canvas::Action::publish(Message::Graph(GraphMessage::SearchCommit)));
+                        }
+                        _ => {
+                            // Handle text input
+                            if let Some(txt) = text {
+                                if !txt.is_empty() && !modifiers.control() && !modifiers.alt() {
+                                    let input = txt.to_string();
+                                    // Filter out control characters
+                                    if input.chars().all(|c| !c.is_control()) {
+                                        return Some(canvas::Action::publish(Message::Graph(
+                                            GraphMessage::SearchInput { text: input }
+                                        )));
+                                    }
+                                }
+                            }
+                            return None;
+                        }
+                    }
+                }
+
+                // Normal keyboard handling
                 match key.as_ref() {
+                    // Ctrl+F or / to activate search
+                    Key::Character("f") | Key::Character("F") if modifiers.control() => {
+                        Some(canvas::Action::publish(Message::Graph(GraphMessage::SearchActivate)))
+                    }
+                    Key::Character("/") if !modifiers.control() => {
+                        Some(canvas::Action::publish(Message::Graph(GraphMessage::SearchActivate)))
+                    }
                     Key::Character("l") | Key::Character("L") if !modifiers.control() => {
                         Some(canvas::Action::publish(Message::Graph(GraphMessage::AutoLayout)))
                     }
@@ -1116,6 +1228,14 @@ impl canvas::Program<Message> for Graph {
                     }
                     Key::Character("?") | Key::Named(iced::keyboard::key::Named::F1) => {
                         Some(canvas::Action::publish(Message::Graph(GraphMessage::ToggleHelp)))
+                    }
+                    Key::Named(iced::keyboard::key::Named::Escape) => {
+                        // Escape closes help if open
+                        if self.show_help {
+                            Some(canvas::Action::publish(Message::Graph(GraphMessage::ToggleHelp)))
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 }
@@ -1238,9 +1358,17 @@ fn stroke_rounded_rect(frame: &mut Frame, pos: Point, size: Size, radius: f32, c
     frame.stroke(&path, Stroke::default().with_color(color).with_width(width));
 }
 
-fn draw_node(frame: &mut Frame, node: &Node) {
+fn draw_node(frame: &mut Frame, node: &Node, dimmed: bool) {
     let height = Graph::node_height(node);
     let corner_radius = 8.0;
+
+    // Opacity modifier for dimmed nodes
+    let opacity = if dimmed { 0.25 } else { 1.0 };
+
+    // Helper to apply dimming to a color
+    let dim = |c: Color| -> Color {
+        Color::from_rgba(c.r, c.g, c.b, c.a * opacity)
+    };
 
     // Subtle outer glow/shadow
     draw_rounded_rect(
@@ -1248,7 +1376,7 @@ fn draw_node(frame: &mut Frame, node: &Node) {
         Point::new(node.position.x - 1.0, node.position.y - 1.0),
         Size::new(NODE_WIDTH + 2.0, height + 2.0),
         corner_radius + 1.0,
-        Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+        dim(Color::from_rgba(0.0, 0.0, 0.0, 0.4)),
     );
 
     // Node background
@@ -1257,7 +1385,7 @@ fn draw_node(frame: &mut Frame, node: &Node) {
         node.position,
         Size::new(NODE_WIDTH, height),
         corner_radius,
-        palette::NODE_BG,
+        dim(palette::NODE_BG),
     );
 
     // Header background (with top corners rounded)
@@ -1277,7 +1405,7 @@ fn draw_node(frame: &mut Frame, node: &Node) {
         builder.arc_to(Point::new(x, y), Point::new(x + r, y), r);
         builder.close();
     });
-    frame.fill(&header_path, palette::NODE_HEADER);
+    frame.fill(&header_path, dim(palette::NODE_HEADER));
 
     // Accent line under header
     let accent_line = Path::line(
@@ -1287,7 +1415,7 @@ fn draw_node(frame: &mut Frame, node: &Node) {
     frame.stroke(
         &accent_line,
         Stroke::default()
-            .with_color(palette::NODE_BORDER)
+            .with_color(dim(palette::NODE_BORDER))
             .with_width(1.0),
     );
 
@@ -1297,21 +1425,22 @@ fn draw_node(frame: &mut Frame, node: &Node) {
         node.position,
         Size::new(NODE_WIDTH, height),
         corner_radius,
-        palette::NODE_BORDER,
+        dim(palette::NODE_BORDER),
         1.0,
     );
 
-    // Node title (truncate if too long)
+    // Node title (truncate if too long) - use custom_name if available
     let max_chars = 22;
-    let display_name = if node.name.len() > max_chars {
-        format!("{}…", &node.name[..max_chars - 1])
+    let name_to_display = node.custom_name.as_ref().unwrap_or(&node.name);
+    let display_name = if name_to_display.len() > max_chars {
+        format!("{}…", &name_to_display[..max_chars - 1])
     } else {
-        node.name.clone()
+        name_to_display.clone()
     };
     let title = Text {
         content: display_name,
         position: Point::new(node.position.x + 12.0, node.position.y + 7.0),
-        color: palette::TEXT_PRIMARY,
+        color: dim(palette::TEXT_PRIMARY),
         size: iced::Pixels(13.0),
         ..Text::default()
     };
@@ -1329,15 +1458,15 @@ fn draw_node(frame: &mut Frame, node: &Node) {
 
         // Outer glow
         let glow = Path::circle(pos, PORT_RADIUS + 3.0);
-        frame.fill(&glow, glow_color);
+        frame.fill(&glow, dim(glow_color));
 
         // Port circle
         let circle = Path::circle(pos, PORT_RADIUS);
-        frame.fill(&circle, port_color);
+        frame.fill(&circle, dim(port_color));
 
         // Inner highlight
         let inner = Path::circle(pos, PORT_RADIUS - 2.0);
-        frame.fill(&inner, Color::from_rgba(1.0, 1.0, 1.0, 0.15));
+        frame.fill(&inner, dim(Color::from_rgba(1.0, 1.0, 1.0, 0.15)));
 
         // Port label (truncate if too long)
         let max_port_chars = 12;
@@ -1353,7 +1482,7 @@ fn draw_node(frame: &mut Frame, node: &Node) {
         let label = Text {
             content: port_display,
             position: Point::new(label_x, pos.y - 5.0),
-            color: palette::TEXT_SECONDARY,
+            color: dim(palette::TEXT_SECONDARY),
             size: iced::Pixels(10.0),
             ..Text::default()
         };
@@ -1488,16 +1617,18 @@ fn draw_help_overlay(frame: &mut Frame, size: Size) {
 
     let shortcuts = [
         ("L", "Auto-layout"),
+        ("Ctrl+F  /  /", "Search nodes"),
         ("Ctrl+Z", "Undo"),
         ("Ctrl+Shift+Z", "Redo"),
         ("Ctrl+Y", "Redo"),
         ("?  /  F1", "Toggle help"),
+        ("Esc", "Close overlay"),
         ("", ""),
         ("Mouse", ""),
         ("Drag port", "Connect"),
-        ("Click link", "Disconnect"),
+        ("Right-click link", "Disconnect"),
         ("Drag node", "Move"),
-        ("Middle drag", "Pan"),
+        ("Drag empty", "Pan"),
         ("Scroll", "Zoom"),
     ];
 
@@ -1557,6 +1688,99 @@ fn draw_help_overlay(frame: &mut Frame, size: Size) {
     let hint = Text {
         content: "Press ? or F1 to close".to_string(),
         position: Point::new(box_x + 20.0, box_y + box_height - 25.0),
+        color: Color::from_rgba(1.0, 1.0, 1.0, 0.4),
+        size: iced::Pixels(10.0),
+        ..Text::default()
+    };
+    frame.fill_text(hint);
+}
+
+fn draw_search_overlay(frame: &mut Frame, size: Size, query: &str, match_count: usize) {
+    // Search bar at top center
+    let bar_width = 320.0;
+    let bar_height = 40.0;
+    let bar_x = (size.width - bar_width) / 2.0;
+    let bar_y = 20.0;
+
+    // Background with shadow
+    draw_rounded_rect(
+        frame,
+        Point::new(bar_x - 2.0, bar_y + 2.0),
+        Size::new(bar_width + 4.0, bar_height),
+        8.0,
+        Color::from_rgba(0.0, 0.0, 0.0, 0.3),
+    );
+
+    // Main bar background
+    draw_rounded_rect(
+        frame,
+        Point::new(bar_x, bar_y),
+        Size::new(bar_width, bar_height),
+        8.0,
+        Color::from_rgb(0.12, 0.12, 0.14),
+    );
+
+    // Border
+    stroke_rounded_rect(
+        frame,
+        Point::new(bar_x, bar_y),
+        Size::new(bar_width, bar_height),
+        8.0,
+        palette::PORT_AUDIO,
+        1.5,
+    );
+
+    // Search icon (magnifying glass represented as text)
+    let icon = Text {
+        content: "/".to_string(),
+        position: Point::new(bar_x + 14.0, bar_y + 11.0),
+        color: palette::TEXT_SECONDARY,
+        size: iced::Pixels(14.0),
+        ..Text::default()
+    };
+    frame.fill_text(icon);
+
+    // Query text with cursor
+    let display_text = if query.is_empty() {
+        "Search nodes...".to_string()
+    } else {
+        format!("{}|", query) // Show cursor
+    };
+    let text_color = if query.is_empty() {
+        palette::TEXT_SECONDARY
+    } else {
+        palette::TEXT_PRIMARY
+    };
+    let query_text = Text {
+        content: display_text,
+        position: Point::new(bar_x + 35.0, bar_y + 12.0),
+        color: text_color,
+        size: iced::Pixels(13.0),
+        ..Text::default()
+    };
+    frame.fill_text(query_text);
+
+    // Match count (right side)
+    if !query.is_empty() {
+        let count_text = if match_count == 1 {
+            "1 match".to_string()
+        } else {
+            format!("{} matches", match_count)
+        };
+        let count = Text {
+            content: count_text,
+            position: Point::new(bar_x + bar_width - 75.0, bar_y + 12.0),
+            color: if match_count > 0 { palette::PORT_AUDIO } else { palette::PORT_MIDI },
+            size: iced::Pixels(11.0),
+            ..Text::default()
+        };
+        frame.fill_text(count);
+    }
+
+    // Hint below
+    let hint = Text {
+        content: "Enter to focus • Esc to close".to_string(),
+        position: Point::new(bar_x + (bar_width - 160.0) / 2.0, bar_y + bar_height + 8.0),
         color: Color::from_rgba(1.0, 1.0, 1.0, 0.4),
         size: iced::Pixels(10.0),
         ..Text::default()
