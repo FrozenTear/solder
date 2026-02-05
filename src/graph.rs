@@ -858,10 +858,11 @@ impl canvas::Program<Message> for Graph {
                     let out_port = out_node.output_ports.iter().find(|p| p.id == link.output_port);
                     let in_port = in_node.input_ports.iter().find(|p| p.id == link.input_port);
 
-                    if let (Some(out_port), Some(in_port)) = (out_port, in_port) {
+                    if let (Some(out_port), Some(_in_port)) = (out_port, in_port) {
                         let start = Self::port_position(out_node, out_port);
-                        let end = Self::port_position(in_node, in_port);
-                        draw_bezier_link(frame, start, end, Color::from_rgb(0.4, 0.7, 0.9));
+                        let end = Self::port_position(in_node, _in_port);
+                        // Use output port's type for link color
+                        draw_bezier_link(frame, start, end, out_port.port_type);
                     }
                 }
             }
@@ -891,7 +892,7 @@ impl canvas::Program<Message> for Graph {
                         let end = self.screen_to_world(cursor_pos);
 
                         // Draw with a pulsing/dashed style
-                        draw_pending_link(&mut frame, start, end, port.direction);
+                        draw_pending_link(&mut frame, start, end, port.direction, port.port_type);
                     }
                 }
                 frame.into_geometry()
@@ -1285,7 +1286,7 @@ fn draw_node(frame: &mut Frame, node: &Node) {
     }
 }
 
-fn draw_bezier_link(frame: &mut Frame, start: Point, end: Point, _color: Color) {
+fn draw_bezier_link(frame: &mut Frame, start: Point, end: Point, port_type: PortType) {
     let dx = end.x - start.x;
     let dy = (end.y - start.y).abs();
 
@@ -1311,11 +1312,18 @@ fn draw_bezier_link(frame: &mut Frame, start: Point, end: Point, _color: Color) 
         );
     });
 
+    // Color based on port type
+    let (color, glow_color) = match port_type {
+        PortType::Audio => (palette::PORT_AUDIO, palette::PORT_AUDIO_GLOW),
+        PortType::Midi => (palette::PORT_MIDI, palette::PORT_MIDI_GLOW),
+        PortType::Video => (palette::PORT_VIDEO, palette::PORT_VIDEO_GLOW),
+    };
+
     // Outer glow layer
     frame.stroke(
         &path,
         Stroke::default()
-            .with_color(palette::LINK_GLOW)
+            .with_color(glow_color)
             .with_width(8.0)
             .with_line_cap(canvas::LineCap::Round),
     );
@@ -1324,7 +1332,7 @@ fn draw_bezier_link(frame: &mut Frame, start: Point, end: Point, _color: Color) 
     frame.stroke(
         &path,
         Stroke::default()
-            .with_color(palette::LINK_COLOR)
+            .with_color(color)
             .with_width(2.5)
             .with_line_cap(canvas::LineCap::Round),
     );
@@ -1339,7 +1347,7 @@ fn draw_bezier_link(frame: &mut Frame, start: Point, end: Point, _color: Color) 
     );
 }
 
-fn draw_pending_link(frame: &mut Frame, start: Point, end: Point, direction: PortDirection) {
+fn draw_pending_link(frame: &mut Frame, start: Point, end: Point, direction: PortDirection, port_type: PortType) {
     // Determine control points based on direction
     let (ctrl_start, ctrl_end) = match direction {
         PortDirection::Output => {
@@ -1363,6 +1371,13 @@ fn draw_pending_link(frame: &mut Frame, start: Point, end: Point, direction: Por
         builder.bezier_curve_to(ctrl_start, ctrl_end, end);
     });
 
+    // Color based on port type
+    let color = match port_type {
+        PortType::Audio => palette::PORT_AUDIO,
+        PortType::Midi => palette::PORT_MIDI,
+        PortType::Video => palette::PORT_VIDEO,
+    };
+
     // Outer glow - more prominent for pending
     frame.stroke(
         &path,
@@ -1372,8 +1387,7 @@ fn draw_pending_link(frame: &mut Frame, start: Point, end: Point, direction: Por
             .with_line_cap(canvas::LineCap::Round),
     );
 
-    // Main cable - use audio color as default for pending connections
-    let color = palette::PORT_AUDIO;
+    // Main cable
     frame.stroke(
         &path,
         Stroke::default()
