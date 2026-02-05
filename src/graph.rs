@@ -642,20 +642,25 @@ impl Graph {
     pub fn hit_test(&self, point: Point) -> HitResult {
         let world_point = self.screen_to_world(point);
 
-        // Check nodes and ports first
+        // Larger hit radius for ports (easier to click)
+        const PORT_HIT_RADIUS: f32 = 15.0;
+
+        // Check ports FIRST across all nodes (ports are on edges, may be outside node bounds)
+        for node in self.nodes.values() {
+            for port in node.input_ports.iter().chain(node.output_ports.iter()) {
+                let port_pos = Self::port_position(node, port);
+                let dist = ((world_point.x - port_pos.x).powi(2) + (world_point.y - port_pos.y).powi(2)).sqrt();
+                if dist < PORT_HIT_RADIUS {
+                    return HitResult::Port { node_id: node.id, port_id: port.id };
+                }
+            }
+        }
+
+        // Then check node bodies
         for node in self.nodes.values() {
             let height = Self::node_height(node);
             let bounds = Rectangle::new(node.position, Size::new(NODE_WIDTH, height));
-
             if bounds.contains(world_point) {
-                // Check ports first (they're on the edges)
-                for port in node.input_ports.iter().chain(node.output_ports.iter()) {
-                    let port_pos = Self::port_position(node, port);
-                    let dist = ((world_point.x - port_pos.x).powi(2) + (world_point.y - port_pos.y).powi(2)).sqrt();
-                    if dist < PORT_RADIUS * 2.0 {
-                        return HitResult::Port { node_id: node.id, port_id: port.id };
-                    }
-                }
                 return HitResult::Node(node.id);
             }
         }
