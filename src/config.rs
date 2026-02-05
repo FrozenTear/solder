@@ -8,6 +8,26 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default)]
     positions: HashMap<String, Position>,
+
+    /// Custom display names for nodes (original_key -> custom_name)
+    #[serde(default)]
+    pub node_renames: HashMap<String, String>,
+
+    /// Last loaded preset path
+    #[serde(default)]
+    pub last_preset: Option<String>,
+
+    /// Whether exclusive mode is enabled
+    #[serde(default)]
+    pub exclusive_mode: bool,
+
+    /// Whether to auto-pin new connections
+    #[serde(default)]
+    pub auto_pin: bool,
+
+    /// Whether ALSA MIDI is enabled
+    #[serde(default)]
+    pub alsa_midi_enabled: bool,
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -68,6 +88,29 @@ impl Config {
 
     fn config_path() -> Option<PathBuf> {
         let dirs = ProjectDirs::from("", "", "solder")?;
-        Some(dirs.config_dir().join("positions.json"))
+        Some(dirs.config_dir().join("config.json"))
+    }
+
+    /// Get custom name for a node
+    pub fn get_node_rename(&self, key: &NodeKey) -> Option<&String> {
+        self.node_renames.get(&key.to_string_key())
+    }
+
+    /// Set custom name for a node
+    pub fn set_node_rename(&mut self, key: NodeKey, name: String) {
+        self.node_renames.insert(key.to_string_key(), name);
+        let _ = self.save();
+    }
+
+    /// Clear custom name for a node
+    pub fn clear_node_rename(&mut self, key: &NodeKey) {
+        self.node_renames.remove(&key.to_string_key());
+        let _ = self.save();
+    }
+
+    /// Get the presets directory path
+    pub fn presets_dir() -> Option<PathBuf> {
+        let dirs = ProjectDirs::from("", "", "solder")?;
+        Some(dirs.config_dir().join("presets"))
     }
 }

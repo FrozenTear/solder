@@ -47,6 +47,17 @@ pub struct Node {
     pub has_saved_position: bool,
     pub input_ports: Vec<Port>,
     pub output_ports: Vec<Port>,
+    /// Custom display name (from config or rename)
+    pub custom_name: Option<String>,
+    /// Node source (PipeWire or ALSA MIDI)
+    pub source: NodeSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum NodeSource {
+    #[default]
+    PipeWire,
+    AlsaMidi,
 }
 
 #[derive(Debug, Clone)]
@@ -95,10 +106,27 @@ pub struct Graph {
     undo_stack: Vec<UndoAction>,
     redo_stack: Vec<UndoAction>,
     pub show_help: bool,
+
+    // Search/filter state
+    pub search_query: String,
+    pub search_active: bool,
+    pub filtered_nodes: std::collections::HashSet<u32>,
+
+    // Preset state
+    pub current_preset: Option<crate::preset::Preset>,
+    pub preset_path: Option<std::path::PathBuf>,
+    pub exclusive_mode: bool,
+
+    // Node renaming state
+    pub renaming_node: Option<u32>,
+    pub rename_text: String,
+
+    // Pinned connections (output_port_id, input_port_id)
+    pub pinned_connections: std::collections::HashSet<(u32, u32)>,
 }
 
 impl Graph {
-    pub fn new(_config: &Config) -> Self {
+    pub fn new(config: &Config) -> Self {
         Self {
             nodes: HashMap::new(),
             links: Vec::new(),
@@ -108,6 +136,15 @@ impl Graph {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             show_help: false,
+            search_query: String::new(),
+            search_active: false,
+            filtered_nodes: std::collections::HashSet::new(),
+            current_preset: None,
+            preset_path: None,
+            exclusive_mode: config.exclusive_mode,
+            renaming_node: None,
+            rename_text: String::new(),
+            pinned_connections: std::collections::HashSet::new(),
         }
     }
 
@@ -616,6 +653,9 @@ impl Graph {
                     .map(|p| (Point::new(p.x, p.y), true))
                     .unwrap_or_else(|| (layout::auto_position(&self.nodes, id), false));
 
+                // Get custom name from config if set
+                let custom_name = config.get_node_rename(&key).cloned();
+
                 // Offset if another node is already at this position
                 let position = self.find_non_overlapping_position(base_position);
 
@@ -632,6 +672,8 @@ impl Graph {
                         has_saved_position,
                         input_ports: Vec::new(),
                         output_ports: Vec::new(),
+                        custom_name,
+                        source: NodeSource::PipeWire,
                     },
                 );
                 self.cache.clear();

@@ -2,6 +2,7 @@ mod config;
 mod graph;
 mod layout;
 mod pipewire_client;
+mod preset;
 
 use iced::widget::canvas;
 use iced::{Element, Length, Subscription, Task, Theme};

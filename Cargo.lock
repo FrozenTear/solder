@@ -2955,6 +2955,7 @@ dependencies = [
  "directories",
  "iced",
  "pipewire",
+ "regex",
  "serde",
  "serde_json",
 ]
