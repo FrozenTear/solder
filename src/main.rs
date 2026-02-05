@@ -62,3 +62,24 @@ fn view(state: &Solder) -> Element<'_, Message> {
 fn subscription(_state: &Solder) -> Subscription<Message> {
     pipewire_client::connect().map(Message::Pipewire)
 }
+
+/// Connect two ports via pw-link
+pub fn pipewire_connect(output_port: u32, input_port: u32) {
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("pw-link")
+            .arg(output_port.to_string())
+            .arg(input_port.to_string())
+            .output();
+    });
+}
+
+/// Disconnect two ports via pw-link -d
+pub fn pipewire_disconnect(output_port: u32, input_port: u32) {
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("pw-link")
+            .arg("-d")
+            .arg(output_port.to_string())
+            .arg(input_port.to_string())
+            .output();
+    });
+}

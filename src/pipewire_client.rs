@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::graph::PortDirection;
+use crate::graph::{PortDirection, PortType};
 
 #[derive(Debug, Clone)]
 pub enum PipewireEvent {
@@ -27,6 +27,7 @@ pub enum PipewireEvent {
         port_id: u32,
         name: String,
         direction: PortDirection,
+        port_type: PortType,
     },
     PortRemoved {
         node_id: u32,
@@ -127,6 +128,18 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
                                 }
                             })
                             .unwrap_or(PortDirection::Output);
+                        let port_type = props
+                            .and_then(|p| p.get("format.dsp"))
+                            .map(|fmt| {
+                                if fmt.contains("midi") {
+                                    PortType::Midi
+                                } else if fmt.contains("video") {
+                                    PortType::Video
+                                } else {
+                                    PortType::Audio
+                                }
+                            })
+                            .unwrap_or(PortType::Audio);
 
                         port_to_node.borrow_mut().insert(global.id, node_id);
 
@@ -135,6 +148,7 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
                             port_id: global.id,
                             name,
                             direction,
+                            port_type,
                         });
                     }
                     pw::types::ObjectType::Link => {

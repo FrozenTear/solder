@@ -30,6 +30,9 @@ pub enum GraphMessage {
     Pan(Vector),
     Zoom { delta: f32, cursor: Point },
     AutoLayout,
+    Undo,
+    Redo,
+    ToggleHelp,
 }
 
 #[derive(Debug, Clone)]
@@ -51,12 +54,21 @@ pub struct Port {
     pub id: u32,
     pub name: String,
     pub direction: PortDirection,
+    pub port_type: PortType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PortDirection {
     Input,
     Output,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum PortType {
+    #[default]
+    Audio,
+    Midi,
+    Video,
 }
 
 #[derive(Debug, Clone)]
@@ -68,12 +80,21 @@ pub struct Link {
     pub input_port: u32,
 }
 
+#[derive(Debug, Clone)]
+pub enum UndoAction {
+    Connect { output_port: u32, input_port: u32 },
+    Disconnect { output_port: u32, input_port: u32 },
+}
+
 pub struct Graph {
     pub nodes: HashMap<u32, Node>,
     pub links: Vec<Link>,
     pub pan_offset: Vector,
     pub zoom: f32,
     cache: Cache,
+    undo_stack: Vec<UndoAction>,
+    redo_stack: Vec<UndoAction>,
+    pub show_help: bool,
 }
 
 impl Graph {
@@ -84,6 +105,9 @@ impl Graph {
             pan_offset: Vector::ZERO,
             zoom: 1.0,
             cache: Cache::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            show_help: false,
         }
     }
 
@@ -130,34 +154,19 @@ impl Graph {
                     }
                 };
 
-                // Spawn pw-link to create the connection
-                std::thread::spawn(move || {
-                    let result = std::process::Command::new("pw-link")
-                        .arg(output_port.to_string())
-                        .arg(input_port.to_string())
-                        .output();
-
-                    if let Err(e) = result {
-                        eprintln!("Failed to create link: {}", e);
-                    }
-                });
+                // Create connection and track for undo
+                crate::pipewire_connect(output_port, input_port);
+                self.undo_stack.push(UndoAction::Connect { output_port, input_port });
+                self.redo_stack.clear(); // Clear redo on new action
             }
             GraphMessage::ConnectionCancelled => {
                 self.cache.clear();
             }
             GraphMessage::DisconnectLink { link_id: _, output_port, input_port } => {
-                // Spawn pw-link -d to disconnect
-                std::thread::spawn(move || {
-                    let result = std::process::Command::new("pw-link")
-                        .arg("-d")
-                        .arg(output_port.to_string())
-                        .arg(input_port.to_string())
-                        .output();
-
-                    if let Err(e) = result {
-                        eprintln!("Failed to disconnect link: {}", e);
-                    }
-                });
+                // Disconnect and track for undo
+                crate::pipewire_disconnect(output_port, input_port);
+                self.undo_stack.push(UndoAction::Disconnect { output_port, input_port });
+                self.redo_stack.clear(); // Clear redo on new action
             }
             GraphMessage::Pan(delta) => {
                 self.pan_offset = self.pan_offset + delta;
@@ -176,6 +185,51 @@ impl Graph {
             }
             GraphMessage::AutoLayout => {
                 self.perform_auto_layout();
+                self.cache.clear();
+            }
+            GraphMessage::Undo => {
+                if let Some(action) = self.undo_stack.pop() {
+                    match &action {
+                        UndoAction::Connect { output_port, input_port } => {
+                            // Undo a connect = disconnect
+                            crate::pipewire_disconnect(*output_port, *input_port);
+                        }
+                        UndoAction::Disconnect { output_port, input_port } => {
+                            // Undo a disconnect = reconnect
+                            crate::pipewire_connect(*output_port, *input_port);
+                        }
+                    }
+                    // Push inverse action to redo stack
+                    let inverse = match action {
+                        UndoAction::Connect { output_port, input_port } =>
+                            UndoAction::Disconnect { output_port, input_port },
+                        UndoAction::Disconnect { output_port, input_port } =>
+                            UndoAction::Connect { output_port, input_port },
+                    };
+                    self.redo_stack.push(inverse);
+                }
+            }
+            GraphMessage::Redo => {
+                if let Some(action) = self.redo_stack.pop() {
+                    match &action {
+                        UndoAction::Connect { output_port, input_port } => {
+                            crate::pipewire_disconnect(*output_port, *input_port);
+                        }
+                        UndoAction::Disconnect { output_port, input_port } => {
+                            crate::pipewire_connect(*output_port, *input_port);
+                        }
+                    }
+                    let inverse = match action {
+                        UndoAction::Connect { output_port, input_port } =>
+                            UndoAction::Disconnect { output_port, input_port },
+                        UndoAction::Disconnect { output_port, input_port } =>
+                            UndoAction::Connect { output_port, input_port },
+                    };
+                    self.undo_stack.push(inverse);
+                }
+            }
+            GraphMessage::ToggleHelp => {
+                self.show_help = !self.show_help;
                 self.cache.clear();
             }
         }
@@ -559,6 +613,7 @@ impl Graph {
                 port_id,
                 name,
                 direction,
+                port_type,
             } => {
                 // Check if this is the first port and node needs repositioning
                 let should_reposition = self.nodes.get(&node_id)
@@ -571,6 +626,7 @@ impl Graph {
                         id: port_id,
                         name,
                         direction,
+                        port_type,
                     };
                     match direction {
                         PortDirection::Input => node.input_ports.push(port),
@@ -846,7 +902,16 @@ impl canvas::Program<Message> for Graph {
             pending.into_geometry()
         };
 
-        vec![content, pending_geo]
+        // Help overlay
+        let help_geo = if self.show_help {
+            let mut frame = Frame::new(renderer, bounds.size());
+            draw_help_overlay(&mut frame, bounds.size());
+            frame.into_geometry()
+        } else {
+            Frame::new(renderer, bounds.size()).into_geometry()
+        };
+
+        vec![content, pending_geo, help_geo]
     }
 
     fn update(
@@ -958,11 +1023,23 @@ impl canvas::Program<Message> for Graph {
                 }
                 _ => None,
             },
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 use iced::keyboard::Key;
                 match key.as_ref() {
-                    Key::Character("l") | Key::Character("L") => {
+                    Key::Character("l") | Key::Character("L") if !modifiers.control() => {
                         Some(canvas::Action::publish(Message::Graph(GraphMessage::AutoLayout)))
+                    }
+                    Key::Character("z") | Key::Character("Z") if modifiers.control() && !modifiers.shift() => {
+                        Some(canvas::Action::publish(Message::Graph(GraphMessage::Undo)))
+                    }
+                    Key::Character("z") | Key::Character("Z") if modifiers.control() && modifiers.shift() => {
+                        Some(canvas::Action::publish(Message::Graph(GraphMessage::Redo)))
+                    }
+                    Key::Character("y") | Key::Character("Y") if modifiers.control() => {
+                        Some(canvas::Action::publish(Message::Graph(GraphMessage::Redo)))
+                    }
+                    Key::Character("?") | Key::Named(iced::keyboard::key::Named::F1) => {
+                        Some(canvas::Action::publish(Message::Graph(GraphMessage::ToggleHelp)))
                     }
                     _ => None,
                 }
@@ -1024,11 +1101,13 @@ mod palette {
     pub const ACCENT_OUTPUT: Color = Color::from_rgb(0.92, 0.65, 0.25);  // Warm amber/gold
     pub const ACCENT_INPUT: Color = Color::from_rgb(0.30, 0.75, 0.85);   // Cool cyan
 
-    // Port colors - softer versions
-    pub const PORT_OUTPUT: Color = Color::from_rgb(0.85, 0.55, 0.20);
-    pub const PORT_OUTPUT_GLOW: Color = Color::from_rgba(0.92, 0.65, 0.25, 0.25);
-    pub const PORT_INPUT: Color = Color::from_rgb(0.25, 0.65, 0.75);
-    pub const PORT_INPUT_GLOW: Color = Color::from_rgba(0.30, 0.75, 0.85, 0.25);
+    // Port type colors (matches qpwgraph conventions)
+    pub const PORT_AUDIO: Color = Color::from_rgb(0.35, 0.75, 0.45);       // Green
+    pub const PORT_AUDIO_GLOW: Color = Color::from_rgba(0.35, 0.75, 0.45, 0.25);
+    pub const PORT_MIDI: Color = Color::from_rgb(0.85, 0.35, 0.35);        // Red
+    pub const PORT_MIDI_GLOW: Color = Color::from_rgba(0.85, 0.35, 0.35, 0.25);
+    pub const PORT_VIDEO: Color = Color::from_rgb(0.35, 0.55, 0.85);       // Blue
+    pub const PORT_VIDEO_GLOW: Color = Color::from_rgba(0.35, 0.55, 0.85, 0.25);
 
     // Text
     pub const TEXT_PRIMARY: Color = Color::from_rgb(0.92, 0.92, 0.94);
@@ -1166,9 +1245,10 @@ fn draw_node(frame: &mut Frame, node: &Node) {
     for port in node.input_ports.iter().chain(node.output_ports.iter()) {
         let pos = Graph::port_position(node, port);
 
-        let (port_color, glow_color) = match port.direction {
-            PortDirection::Input => (palette::PORT_INPUT, palette::PORT_INPUT_GLOW),
-            PortDirection::Output => (palette::PORT_OUTPUT, palette::PORT_OUTPUT_GLOW),
+        let (port_color, glow_color) = match port.port_type {
+            PortType::Audio => (palette::PORT_AUDIO, palette::PORT_AUDIO_GLOW),
+            PortType::Midi => (palette::PORT_MIDI, palette::PORT_MIDI_GLOW),
+            PortType::Video => (palette::PORT_VIDEO, palette::PORT_VIDEO_GLOW),
         };
 
         // Outer glow
@@ -1292,11 +1372,8 @@ fn draw_pending_link(frame: &mut Frame, start: Point, end: Point, direction: Por
             .with_line_cap(canvas::LineCap::Round),
     );
 
-    // Main cable - brighter color
-    let color = match direction {
-        PortDirection::Output => palette::PORT_OUTPUT,
-        PortDirection::Input => palette::PORT_INPUT,
-    };
+    // Main cable - use audio color as default for pending connections
+    let color = palette::PORT_AUDIO;
     frame.stroke(
         &path,
         Stroke::default()
@@ -1310,4 +1387,90 @@ fn draw_pending_link(frame: &mut Frame, start: Point, end: Point, direction: Por
     frame.fill(&cursor_dot, Color::from_rgba(1.0, 1.0, 1.0, 0.3));
     let cursor_inner = Path::circle(end, 3.0);
     frame.fill(&cursor_inner, color);
+}
+
+fn draw_help_overlay(frame: &mut Frame, size: Size) {
+    // Semi-transparent background
+    frame.fill_rectangle(
+        Point::ORIGIN,
+        size,
+        Color::from_rgba(0.0, 0.0, 0.0, 0.75),
+    );
+
+    let shortcuts = [
+        ("L", "Auto-layout"),
+        ("Ctrl+Z", "Undo"),
+        ("Ctrl+Shift+Z", "Redo"),
+        ("Ctrl+Y", "Redo"),
+        ("?  /  F1", "Toggle help"),
+        ("", ""),
+        ("Mouse", ""),
+        ("Drag port", "Connect"),
+        ("Click link", "Disconnect"),
+        ("Drag node", "Move"),
+        ("Middle drag", "Pan"),
+        ("Scroll", "Zoom"),
+    ];
+
+    let box_width = 280.0;
+    let line_height = 24.0;
+    let box_height = shortcuts.len() as f32 * line_height + 60.0;
+    let box_x = (size.width - box_width) / 2.0;
+    let box_y = (size.height - box_height) / 2.0;
+
+    // Box background
+    draw_rounded_rect(
+        frame,
+        Point::new(box_x, box_y),
+        Size::new(box_width, box_height),
+        12.0,
+        Color::from_rgb(0.12, 0.12, 0.14),
+    );
+
+    // Title
+    let title = Text {
+        content: "Keyboard Shortcuts".to_string(),
+        position: Point::new(box_x + 20.0, box_y + 20.0),
+        color: palette::TEXT_PRIMARY,
+        size: iced::Pixels(16.0),
+        ..Text::default()
+    };
+    frame.fill_text(title);
+
+    // Shortcuts
+    for (i, (key, action)) in shortcuts.iter().enumerate() {
+        let y = box_y + 55.0 + i as f32 * line_height;
+
+        if !key.is_empty() {
+            let key_text = Text {
+                content: key.to_string(),
+                position: Point::new(box_x + 20.0, y),
+                color: palette::PORT_AUDIO,
+                size: iced::Pixels(12.0),
+                ..Text::default()
+            };
+            frame.fill_text(key_text);
+        }
+
+        if !action.is_empty() {
+            let action_text = Text {
+                content: action.to_string(),
+                position: Point::new(box_x + 130.0, y),
+                color: palette::TEXT_SECONDARY,
+                size: iced::Pixels(12.0),
+                ..Text::default()
+            };
+            frame.fill_text(action_text);
+        }
+    }
+
+    // Press any key hint
+    let hint = Text {
+        content: "Press ? or F1 to close".to_string(),
+        position: Point::new(box_x + 20.0, box_y + box_height - 25.0),
+        color: Color::from_rgba(1.0, 1.0, 1.0, 0.4),
+        size: iced::Pixels(10.0),
+        ..Text::default()
+    };
+    frame.fill_text(hint);
 }
