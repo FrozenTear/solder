@@ -504,6 +504,39 @@ impl Graph {
             }
         }
 
+        // Third pass: reposition sources one more time based on FINAL output positions
+        // This minimizes line length after downstream nodes have been positioned
+        let mut final_source_desired: Vec<(u32, f32, f32)> = sources.iter().map(|&src| {
+            let height = self.nodes.get(&src).map(|n| Self::node_height(n)).unwrap_or(80.0);
+            let outputs = outgoing.get(&src).cloned().unwrap_or_default();
+            let target_y = if !outputs.is_empty() {
+                // Use average Y of outputs (which are now in final positions)
+                let sum: f32 = outputs.iter()
+                    .filter_map(|&out| node_y.get(&out).copied())
+                    .sum();
+                let count = outputs.iter()
+                    .filter(|&out| node_y.contains_key(out))
+                    .count();
+                if count > 0 { sum / count as f32 } else { START_Y }
+            } else {
+                START_Y
+            };
+            (src, target_y, height)
+        }).collect();
+
+        final_source_desired.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Clear and rebuild source positions
+        let source_slots_final: &mut Vec<(f32, f32)> = col_slots.entry(0).or_default();
+        source_slots_final.clear();
+
+        for (src, desired_y, height) in final_source_desired {
+            let final_y = Self::find_free_y(desired_y, height, source_slots_final, ROW_GAP, START_Y);
+            node_y.insert(src, final_y);
+            source_slots_final.push((final_y, height));
+            source_slots_final.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
         // Apply positions to connected nodes
         for (&id, &col) in &node_col {
             if let Some(node) = self.nodes.get_mut(&id) {
