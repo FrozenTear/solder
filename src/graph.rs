@@ -96,7 +96,8 @@ impl Graph {
                 }
             }
             GraphMessage::NodeDragEnded { node_id } => {
-                if let Some(node) = self.nodes.get(&node_id) {
+                if let Some(node) = self.nodes.get_mut(&node_id) {
+                    node.has_saved_position = true;
                     let key = NodeKey {
                         node_name: node.name.clone(),
                         app_name: node.app_name.clone(),
