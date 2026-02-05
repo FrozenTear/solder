@@ -84,8 +84,9 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
                     pw::types::ObjectType::Node => {
                         let props = global.props.as_ref();
                         let name = props
-                            .and_then(|p| p.get("node.name"))
+                            .and_then(|p| p.get("node.description"))
                             .or_else(|| props.and_then(|p| p.get("node.nick")))
+                            .or_else(|| props.and_then(|p| p.get("node.name")))
                             .unwrap_or("Unknown")
                             .to_string();
                         let app_name = props
