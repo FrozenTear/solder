@@ -469,7 +469,7 @@ impl Graph {
 
         // Compute initial Y positions for all non-source nodes
         for col in 1..=max_col {
-            let mut col_nodes: Vec<u32> = node_col.iter()
+            let col_nodes: Vec<u32> = node_col.iter()
                 .filter(|&(_, &c)| c == col)
                 .map(|(&id, _)| id)
                 .collect();
@@ -556,7 +556,7 @@ impl Graph {
                 .collect();
 
             // Compute desired Y and output group for each node
-            let mut node_desired: Vec<(u32, f32, u32)> = col_nodes.iter().map(|&id| {
+            let mut node_desired: Vec<(u32, f32, f32)> = col_nodes.iter().map(|&id| {
                 let desired = incoming.get(&id).map(|ins| {
                     // Get all inputs from immediately previous column
                     let prev_col_ys: Vec<f32> = ins.iter()
@@ -571,19 +571,19 @@ impl Graph {
                     }
                 }).unwrap_or(START_Y);
 
-                // Get first output destination as group key (for grouping nodes with same output)
-                let output_group = outgoing.get(&id)
-                    .and_then(|outs| outs.first().copied())
-                    .unwrap_or(u32::MAX);
+                // Get Y position of first output destination as group key
+                let output_group_y = outgoing.get(&id)
+                    .and_then(|outs| outs.first().and_then(|&out_id| node_y.get(&out_id).copied()))
+                    .unwrap_or(f32::MAX);
 
-                (id, desired, output_group)
+                (id, desired, output_group_y)
             }).collect();
 
-            // Sort by: 1) output group (to cluster nodes with same destination)
+            // Sort by: 1) output group Y (to cluster nodes with same destination)
             //          2) desired Y within group
             node_desired.sort_by(|a, b| {
-                // First compare output groups
-                match a.2.cmp(&b.2) {
+                // First compare output group Y positions
+                match a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal) {
                     std::cmp::Ordering::Equal => {
                         // Same output group - sort by desired Y
                         a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -635,6 +635,123 @@ impl Graph {
             source_slots_final.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         }
 
+        // Fourth pass: reposition sinks based on FINAL input positions
+        let mut final_sink_desired: Vec<(u32, f32, f32)> = sinks.iter().map(|&sink| {
+            let height = self.nodes.get(&sink).map(|n| Self::node_height(n)).unwrap_or(80.0);
+            let inputs = incoming.get(&sink).cloned().unwrap_or_default();
+            let target_y = if !inputs.is_empty() {
+                let sum: f32 = inputs.iter()
+                    .filter_map(|&inp| node_y.get(&inp).copied())
+                    .sum();
+                let count = inputs.iter()
+                    .filter(|&inp| node_y.contains_key(inp))
+                    .count();
+                if count > 0 { sum / count as f32 } else { START_Y }
+            } else {
+                START_Y
+            };
+            (sink, target_y, height)
+        }).collect();
+
+        final_sink_desired.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Clear and rebuild sink positions
+        let sink_slots_final: &mut Vec<(f32, f32)> = col_slots.entry(sink_col).or_default();
+        sink_slots_final.clear();
+
+        for (sink, desired_y, height) in final_sink_desired {
+            let final_y = Self::find_free_y(desired_y, height, sink_slots_final, ROW_GAP, START_Y);
+            node_y.insert(sink, final_y);
+            sink_slots_final.push((final_y, height));
+            sink_slots_final.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // Iterative refinement: move each node toward weighted average Y of neighbors
+        // Adjacent-column neighbors pull harder (they're the visible diagonal connections)
+        for _ in 0..10 {
+            let mut desired_ys: HashMap<u32, f32> = HashMap::new();
+
+            for (&id, &col) in &node_col {
+                let mut weighted_sum: f32 = 0.0;
+                let mut weight_total: f32 = 0.0;
+
+                let mut add_neighbor = |neighbor_id: u32| {
+                    if let Some(&y) = node_y.get(&neighbor_id) {
+                        let neighbor_col = node_col.get(&neighbor_id).copied().unwrap_or(col);
+                        let col_dist = (col as f32 - neighbor_col as f32).abs().max(1.0);
+                        let w = 1.0 / col_dist;
+                        weighted_sum += y * w;
+                        weight_total += w;
+                    }
+                };
+
+                if let Some(ins) = incoming.get(&id) {
+                    for &inp in ins {
+                        add_neighbor(inp);
+                    }
+                }
+                if let Some(outs) = outgoing.get(&id) {
+                    for &out in outs {
+                        add_neighbor(out);
+                    }
+                }
+
+                if weight_total > 0.0 {
+                    let avg = weighted_sum / weight_total;
+                    let current = node_y.get(&id).copied().unwrap_or(START_Y);
+                    desired_ys.insert(id, current + (avg - current) * 0.7);
+                }
+            }
+
+            // Apply desired Ys, then resolve collisions column by column
+            for (&id, &desired) in &desired_ys {
+                node_y.insert(id, desired);
+            }
+
+            for col in 0..=max_col {
+                let mut col_nodes: Vec<(u32, f32, f32)> = node_col.iter()
+                    .filter(|&(_, &c)| c == col)
+                    .map(|(&id, _)| {
+                        let y = node_y.get(&id).copied().unwrap_or(START_Y);
+                        let height = self.nodes.get(&id).map(|n| Self::node_height(n)).unwrap_or(80.0);
+                        (id, y, height)
+                    })
+                    .collect();
+
+                col_nodes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Symmetric overlap resolution: spread overlapping pairs apart equally
+                for _ in 0..50 {
+                    let mut any_overlap = false;
+                    for i in 0..col_nodes.len().saturating_sub(1) {
+                        let needed = col_nodes[i].1 + col_nodes[i].2 + ROW_GAP;
+                        if col_nodes[i + 1].1 < needed {
+                            let overlap = needed - col_nodes[i + 1].1;
+                            col_nodes[i].1 -= overlap / 2.0;
+                            col_nodes[i + 1].1 += overlap / 2.0;
+                            any_overlap = true;
+                        }
+                    }
+                    // Enforce min_y
+                    if !col_nodes.is_empty() && col_nodes[0].1 < START_Y {
+                        col_nodes[0].1 = START_Y;
+                    }
+                    if !any_overlap { break; }
+                }
+                // Safety: ensure no overlaps remain
+                for i in 1..col_nodes.len() {
+                    let prev_bottom = col_nodes[i - 1].1 + col_nodes[i - 1].2 + ROW_GAP;
+                    if col_nodes[i].1 < prev_bottom {
+                        col_nodes[i].1 = prev_bottom;
+                    }
+                }
+
+                for &(id, y, _) in &col_nodes {
+                    node_y.insert(id, y);
+                }
+            }
+        }
+
         // Apply positions to connected nodes
         for (&id, &col) in &node_col {
             if let Some(node) = self.nodes.get_mut(&id) {
@@ -670,21 +787,22 @@ impl Graph {
             return desired;
         }
 
-        // Search for free slot in small increments (gap/2) to stay as close as possible
+        // Search for free slot in small increments, checking both directions at each step
         let search_step = (gap / 2.0).max(5.0);
         for offset in 1..500 {
             let step = search_step * offset as f32;
 
-            // Try below first (more natural flow)
-            let try_below = desired + step;
-            if !overlaps(try_below) {
-                return try_below;
-            }
-
-            // Try above
             let try_above = desired - step;
-            if try_above >= min_y && !overlaps(try_above) {
-                return try_above;
+            let try_below = desired + step;
+            let above_ok = try_above >= min_y && !overlaps(try_above);
+            let below_ok = !overlaps(try_below);
+
+            // Both free at same distance — prefer below (natural flow direction)
+            match (above_ok, below_ok) {
+                (true, true) => return try_below,
+                (true, false) => return try_above,
+                (false, true) => return try_below,
+                (false, false) => {}
             }
         }
 
