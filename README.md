@@ -21,20 +21,11 @@ Solder provides a visual interface for managing PipeWire audio/MIDI routing. It 
 
 ## Install
 
-Download and install the latest binary:
-
 ```sh
-curl -L https://github.com/FrozenTear/solder/releases/latest/download/solder -o ~/.local/bin/solder
-chmod +x ~/.local/bin/solder
+curl -fsSL https://raw.githubusercontent.com/FrozenTear/solder/master/install.sh | sh
 ```
 
-To add it to your app launcher, also install the desktop entry and icon:
-
-```sh
-curl -L https://raw.githubusercontent.com/FrozenTear/solder/master/assets/solder.desktop -o ~/.local/share/applications/solder.desktop
-curl -L https://raw.githubusercontent.com/FrozenTear/solder/master/assets/solder.svg -o ~/.local/share/icons/hicolor/scalable/apps/solder.svg
-gtk-update-icon-cache ~/.local/share/icons/hicolor/ 2>/dev/null; true
-```
+This installs the binary to `~/.local/bin/`, the desktop entry and icon to the right places so it shows up in your app launcher.
 
 Requires PipeWire to be running and `~/.local/bin` on your `PATH`.
 

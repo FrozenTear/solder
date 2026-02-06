@@ -15,6 +15,7 @@ use pipewire_client::PipewireEvent;
 fn main() -> iced::Result {
     let mut settings = iced::window::Settings::default();
     settings.icon = icon::app_icon();
+    settings.platform_specific.application_id = "solder".to_string();
 
     iced::application(init, update, view)
         .title("Solder")
