@@ -15,9 +15,11 @@ curl -fSL "https://github.com/${REPO}/releases/latest/download/solder" -o "${BIN
 chmod +x "${BIN_DIR}/solder"
 
 echo "  Installing desktop entry and icon..."
-curl -fSL "https://raw.githubusercontent.com/${REPO}/master/assets/solder.desktop" -o "${APP_DIR}/solder.desktop"
 curl -fSL "https://raw.githubusercontent.com/${REPO}/master/assets/solder.svg" -o "${ICON_DIR}/solder.svg"
+curl -fSL "https://raw.githubusercontent.com/${REPO}/master/assets/solder.desktop" -o /tmp/solder.desktop
+sed -e "s|Exec=solder|Exec=${BIN_DIR}/solder|" \
+    -e "s|Icon=solder|Icon=${ICON_DIR}/solder.svg|" \
+    /tmp/solder.desktop > "${APP_DIR}/solder.desktop"
+rm /tmp/solder.desktop
 
-gtk-update-icon-cache "${HOME}/.local/share/icons/hicolor/" 2>/dev/null || true
-
-echo "Done! Make sure ${BIN_DIR} is on your PATH."
+echo "Done!"
