@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Solder
+Comment=Visual node graph editor for PipeWire
+Exec=solder
+Icon=solder
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Mixer;
+Keywords=pipewire;audio;mixer;routing;

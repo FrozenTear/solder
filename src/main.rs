@@ -1,5 +1,6 @@
 mod config;
 mod graph;
+mod icon;
 mod layout;
 mod pipewire_client;
 mod preset;
@@ -12,8 +13,12 @@ use graph::{Graph, GraphMessage};
 use pipewire_client::PipewireEvent;
 
 fn main() -> iced::Result {
+    let mut settings = iced::window::Settings::default();
+    settings.icon = icon::app_icon();
+
     iced::application(init, update, view)
         .title("Solder")
+        .window(settings)
         .subscription(subscription)
         .theme(theme)
         .antialiasing(true)

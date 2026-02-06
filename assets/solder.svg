@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <radialGradient id="glow-green" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#59bf73" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#59bf73" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow-amber" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#eba940" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#eba940" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow-center" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="30%" stop-color="#4dbfd9" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#4dbfd9" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="trace" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#59bf73"/>
+      <stop offset="50%" stop-color="#4dbfd9"/>
+      <stop offset="100%" stop-color="#eba940"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect x="8" y="8" width="240" height="240" rx="40" ry="40" fill="#15151a"/>
+  <rect x="8" y="8" width="240" height="240" rx="40" ry="40" fill="none" stroke="#2a2a30" stroke-width="2"/>
+
+  <!-- Subtle background grid dots -->
+  <g fill="#ffffff" opacity="0.04">
+    <circle cx="68" cy="88" r="2"/><circle cx="108" cy="88" r="2"/>
+    <circle cx="148" cy="88" r="2"/><circle cx="188" cy="88" r="2"/>
+    <circle cx="68" cy="128" r="2"/><circle cx="188" cy="128" r="2"/>
+    <circle cx="68" cy="168" r="2"/><circle cx="108" cy="168" r="2"/>
+    <circle cx="148" cy="168" r="2"/><circle cx="188" cy="168" r="2"/>
+  </g>
+
+  <!-- Connection trace (curved) -->
+  <path d="M 78 128 C 110 128, 108 100, 128 100 C 148 100, 146 128, 178 128"
+        fill="none" stroke="url(#trace)" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Glow halos -->
+  <circle cx="78" cy="128" r="36" fill="url(#glow-green)"/>
+  <circle cx="178" cy="128" r="36" fill="url(#glow-amber)"/>
+  <circle cx="128" cy="100" r="28" fill="url(#glow-center)"/>
+
+  <!-- Left node (output - green) -->
+  <circle cx="78" cy="128" r="16" fill="#1c1c22" stroke="#59bf73" stroke-width="3"/>
+  <circle cx="78" cy="128" r="7" fill="#59bf73"/>
+
+  <!-- Right node (input - amber) -->
+  <circle cx="178" cy="128" r="16" fill="#1c1c22" stroke="#eba940" stroke-width="3"/>
+  <circle cx="178" cy="128" r="7" fill="#eba940"/>
+
+  <!-- Center solder point -->
+  <circle cx="128" cy="100" r="8" fill="#1c1c22" stroke="#4dbfd9" stroke-width="2.5"/>
+  <circle cx="128" cy="100" r="4" fill="#4dbfd9"/>
+  <circle cx="128" cy="100" r="2" fill="#ffffff" opacity="0.8"/>
+</svg>
