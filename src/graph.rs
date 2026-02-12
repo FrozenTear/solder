@@ -99,6 +99,57 @@ pub enum PortType {
     Video,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NodeCategory {
+    AudioSource,    // Output-only node with audio ports
+    AudioSink,      // Input-only node with audio ports
+    AudioProcessor, // Both inputs and outputs with audio ports
+    Video,          // Any node with video ports
+    Midi,           // Any node with MIDI ports
+}
+
+impl NodeCategory {
+    fn from_node(node: &Node) -> Option<Self> {
+        let has_video = node.input_ports.iter().chain(node.output_ports.iter())
+            .any(|p| p.port_type == PortType::Video);
+        let has_midi = node.input_ports.iter().chain(node.output_ports.iter())
+            .any(|p| p.port_type == PortType::Midi);
+
+        if has_video { return Some(NodeCategory::Video); }
+        if has_midi { return Some(NodeCategory::Midi); }
+
+        let has_inputs = !node.input_ports.is_empty();
+        let has_outputs = !node.output_ports.is_empty();
+        match (has_inputs, has_outputs) {
+            (false, true) => Some(NodeCategory::AudioSource),
+            (true, false) => Some(NodeCategory::AudioSink),
+            (true, true) => Some(NodeCategory::AudioProcessor),
+            (false, false) => None,
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self {
+            NodeCategory::AudioSource => palette::CAT_AUDIO_SOURCE,
+            NodeCategory::AudioSink => palette::CAT_AUDIO_SINK,
+            NodeCategory::AudioProcessor => palette::CAT_AUDIO_PROCESSOR,
+            NodeCategory::Video => palette::CAT_VIDEO,
+            NodeCategory::Midi => palette::CAT_MIDI,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn label(&self) -> &'static str {
+        match self {
+            NodeCategory::AudioSource => "Audio Source",
+            NodeCategory::AudioSink => "Audio Sink",
+            NodeCategory::AudioProcessor => "Audio Processor",
+            NodeCategory::Video => "Video",
+            NodeCategory::Midi => "MIDI",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Link {
     pub id: u32,
@@ -1381,6 +1432,13 @@ impl canvas::Program<Message> for Graph {
             Frame::new(renderer, bounds.size()).into_geometry()
         };
 
+        // Legend overlay (always visible)
+        let legend_geo = {
+            let mut frame = Frame::new(renderer, bounds.size());
+            draw_legend(&mut frame, bounds.size());
+            frame.into_geometry()
+        };
+
         // Profile picker overlay (screen space)
         let picker_geo = if let Some(ref picker) = self.profile_picker {
             let mut frame = Frame::new(renderer, bounds.size());
@@ -1391,7 +1449,7 @@ impl canvas::Program<Message> for Graph {
             Frame::new(renderer, bounds.size()).into_geometry()
         };
 
-        vec![content, pending_geo, help_geo, search_geo, picker_geo]
+        vec![content, pending_geo, help_geo, search_geo, legend_geo, picker_geo]
     }
 
     fn update(
@@ -1730,8 +1788,8 @@ mod palette {
     pub const PORT_AUDIO_GLOW: Color = Color::from_rgba(0.35, 0.75, 0.45, 0.25);
     pub const PORT_MIDI: Color = Color::from_rgb(0.85, 0.35, 0.35);        // Red
     pub const PORT_MIDI_GLOW: Color = Color::from_rgba(0.85, 0.35, 0.35, 0.25);
-    pub const PORT_VIDEO: Color = Color::from_rgb(0.35, 0.55, 0.85);       // Blue
-    pub const PORT_VIDEO_GLOW: Color = Color::from_rgba(0.35, 0.55, 0.85, 0.25);
+    pub const PORT_VIDEO: Color = Color::from_rgb(0.55, 0.35, 0.85);       // Purple
+    pub const PORT_VIDEO_GLOW: Color = Color::from_rgba(0.55, 0.35, 0.85, 0.25);
 
     // Text
     pub const TEXT_PRIMARY: Color = Color::from_rgb(0.92, 0.92, 0.94);
@@ -1740,6 +1798,13 @@ mod palette {
     // Links
     pub const LINK_COLOR: Color = Color::from_rgb(0.50, 0.70, 0.80);
     pub const LINK_GLOW: Color = Color::from_rgba(0.50, 0.70, 0.80, 0.15);
+
+    // Node category accent colors
+    pub const CAT_AUDIO_SOURCE: Color = Color::from_rgb(0.92, 0.65, 0.25);    // Warm amber
+    pub const CAT_AUDIO_SINK: Color = Color::from_rgb(0.20, 0.80, 0.65);      // Teal
+    pub const CAT_AUDIO_PROCESSOR: Color = Color::from_rgb(0.35, 0.75, 0.45); // Green
+    pub const CAT_VIDEO: Color = Color::from_rgb(0.55, 0.35, 0.85);           // Purple
+    pub const CAT_MIDI: Color = Color::from_rgb(0.85, 0.35, 0.35);            // Red
 }
 
 fn draw_rounded_rect(frame: &mut Frame, pos: Point, size: Size, radius: f32, color: Color) {
@@ -1856,6 +1921,25 @@ fn draw_node(frame: &mut Frame, node: &Node, dimmed: bool) {
         dim(palette::NODE_BORDER),
         1.0,
     );
+
+    // Left accent stripe (category color)
+    if let Some(category) = NodeCategory::from_node(node) {
+        let stripe_width = 3.0;
+        let inset = 1.0;
+        let stripe = Path::new(|builder| {
+            let x = node.position.x + inset;
+            let y_top = node.position.y + corner_radius;
+            let y_bottom = node.position.y + height - corner_radius;
+            builder.move_to(Point::new(x, y_top));
+            builder.line_to(Point::new(x, y_bottom));
+        });
+        frame.stroke(
+            &stripe,
+            Stroke::default()
+                .with_color(dim(category.color()))
+                .with_width(stripe_width),
+        );
+    }
 
     // Node title (truncate if too long) - use custom_name if available
     let max_chars = 22;
@@ -2347,6 +2431,48 @@ fn picker_screen_rect(picker: &ProfilePickerState, pan_offset: Vector, zoom: f32
     let item_count = if picker.profiles.is_empty() { 1 } else { picker.profiles.len() };
     let total_height = PICKER_HEADER_HEIGHT + item_count as f32 * PICKER_ITEM_HEIGHT + PICKER_PADDING * 2.0;
     (screen_x, screen_y, box_w, total_height)
+}
+
+fn draw_legend(frame: &mut Frame, size: Size) {
+    let categories: &[(Color, &str)] = &[
+        (palette::CAT_AUDIO_SOURCE, "Audio Source"),
+        (palette::CAT_AUDIO_SINK, "Audio Sink"),
+        (palette::CAT_AUDIO_PROCESSOR, "Audio Processor"),
+        (palette::CAT_VIDEO, "Video"),
+        (palette::CAT_MIDI, "MIDI"),
+    ];
+
+    let line_height = 18.0;
+    let padding = 10.0;
+    let box_width = 130.0;
+    let box_height = categories.len() as f32 * line_height + padding * 2.0;
+    let margin = 12.0;
+    let box_x = margin;
+    let box_y = size.height - box_height - margin;
+
+    // Background
+    draw_rounded_rect(
+        frame,
+        Point::new(box_x, box_y),
+        Size::new(box_width, box_height),
+        6.0,
+        Color::from_rgba(0.08, 0.08, 0.10, 0.85),
+    );
+
+    // Items: colored dot + label
+    for (i, (color, label)) in categories.iter().enumerate() {
+        let y = box_y + padding + i as f32 * line_height;
+        let dot = Path::circle(Point::new(box_x + padding + 4.0, y + 6.0), 4.0);
+        frame.fill(&dot, *color);
+
+        frame.fill_text(Text {
+            content: label.to_string(),
+            position: Point::new(box_x + padding + 14.0, y),
+            color: palette::TEXT_SECONDARY,
+            size: iced::Pixels(11.0),
+            ..Text::default()
+        });
+    }
 }
 
 fn draw_profile_picker(frame: &mut Frame, picker: &ProfilePickerState, pan_offset: Vector, zoom: f32, cursor: Option<Point>) {
