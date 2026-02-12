@@ -1,6 +1,6 @@
 use iced::mouse;
 use iced::widget::canvas::{self, Cache, Frame, Geometry, Path, Stroke, Text};
-use iced::{Color, Point, Rectangle, Size, Vector};
+use iced::{Color, Point, Rectangle, Size, Task, Vector};
 use std::collections::HashMap;
 
 use crate::config::{Config, NodeKey, Position};
@@ -13,6 +13,7 @@ pub const NODE_HEADER_HEIGHT: f32 = 28.0;
 pub const PORT_HEIGHT: f32 = 22.0;
 pub const PORT_RADIUS: f32 = 6.0;
 pub const PORT_SPACING: f32 = 4.0;
+pub const GHOST_NODE_HEIGHT: f32 = 52.0;
 
 #[derive(Debug, Clone)]
 pub enum GraphMessage {
@@ -39,6 +40,14 @@ pub enum GraphMessage {
     SearchBackspace,
     SearchClear,
     SearchCommit,
+    // Device activation/deactivation
+    DeactivateDevice { device_id: u32 },
+    ShowProfilePicker { ghost_index: usize },
+    ActivateDeviceProfile { device_id: u32, device_name: String, profile_index: u32 },
+    DismissProfilePicker,
+    ProfilesLoaded { device_id: u32, profiles: Vec<DeviceProfile> },
+    GhostDragged { ghost_index: usize, delta: Vector },
+    GhostDragEnded { ghost_index: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +66,8 @@ pub struct Node {
     pub custom_name: Option<String>,
     /// Node source (PipeWire or ALSA MIDI)
     pub source: NodeSource,
+    /// Parent device ID (if this node belongs to a hardware device)
+    pub device_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -103,6 +114,37 @@ pub enum UndoAction {
     Disconnect { output_port: u32, input_port: u32 },
 }
 
+pub struct DeviceInfo {
+    pub id: u32,
+    pub name: String,
+    pub description: String,
+    pub api: String,
+    pub active_node_ids: Vec<u32>,
+}
+
+pub struct GhostNode {
+    pub device_id: u32,
+    pub device_name: String,
+    pub display_name: String,
+    pub position: Point,
+    pub has_saved_position: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceProfile {
+    pub index: u32,
+    pub name: String,
+    pub description: String,
+}
+
+pub struct ProfilePickerState {
+    pub device_id: u32,
+    pub device_name: String,
+    pub profiles: Vec<DeviceProfile>,
+    pub position: Point,
+    pub last_used_index: Option<u32>,
+}
+
 pub struct Graph {
     pub nodes: HashMap<u32, Node>,
     pub links: Vec<Link>,
@@ -129,6 +171,11 @@ pub struct Graph {
 
     // Pinned connections (output_port_id, input_port_id)
     pub pinned_connections: std::collections::HashSet<(u32, u32)>,
+
+    // Device tracking
+    pub devices: HashMap<u32, DeviceInfo>,
+    pub ghost_nodes: Vec<GhostNode>,
+    pub profile_picker: Option<ProfilePickerState>,
 }
 
 impl Graph {
@@ -151,10 +198,13 @@ impl Graph {
             renaming_node: None,
             rename_text: String::new(),
             pinned_connections: std::collections::HashSet::new(),
+            devices: HashMap::new(),
+            ghost_nodes: Vec::new(),
+            profile_picker: None,
         }
     }
 
-    pub fn update(&mut self, message: GraphMessage, config: &mut Config) {
+    pub fn update(&mut self, message: GraphMessage, config: &mut Config) -> Task<Message> {
         match message {
             GraphMessage::NodeDragged { node_id, delta } => {
                 if let Some(node) = self.nodes.get_mut(&node_id) {
@@ -314,7 +364,65 @@ impl Graph {
                 self.filtered_nodes.clear();
                 self.cache.clear();
             }
+            GraphMessage::DeactivateDevice { device_id } => {
+                crate::set_device_profile(device_id, 0);
+                // PipeWire will send NodeRemoved events → ghost appears via handle_pipewire_event
+            }
+            GraphMessage::ShowProfilePicker { ghost_index } => {
+                if let Some(ghost) = self.ghost_nodes.get(ghost_index) {
+                    let device_id = ghost.device_id;
+                    let device_name = ghost.device_name.clone();
+                    let last_used = config.get_device_profile(&device_name);
+                    self.profile_picker = Some(ProfilePickerState {
+                        device_id,
+                        device_name,
+                        profiles: Vec::new(),
+                        position: ghost.position,
+                        last_used_index: last_used,
+                    });
+                    self.cache.clear();
+                    return Task::perform(
+                        crate::load_device_profiles(device_id),
+                        move |profiles| Message::Graph(GraphMessage::ProfilesLoaded { device_id, profiles }),
+                    );
+                }
+            }
+            GraphMessage::ProfilesLoaded { device_id, profiles } => {
+                if let Some(ref mut picker) = self.profile_picker {
+                    if picker.device_id == device_id {
+                        picker.profiles = profiles;
+                        self.cache.clear();
+                    }
+                }
+            }
+            GraphMessage::ActivateDeviceProfile { device_id, device_name, profile_index } => {
+                config.set_device_profile(device_name, profile_index);
+                crate::set_device_profile(device_id, profile_index);
+                self.profile_picker = None;
+                self.cache.clear();
+                // PipeWire will send NodeAdded events → ghost removed via handle_pipewire_event
+            }
+            GraphMessage::DismissProfilePicker => {
+                self.profile_picker = None;
+                self.cache.clear();
+            }
+            GraphMessage::GhostDragged { ghost_index, delta } => {
+                if let Some(ghost) = self.ghost_nodes.get_mut(ghost_index) {
+                    ghost.position = ghost.position + delta / self.zoom;
+                    self.cache.clear();
+                }
+            }
+            GraphMessage::GhostDragEnded { ghost_index } => {
+                if let Some(ghost) = self.ghost_nodes.get_mut(ghost_index) {
+                    ghost.has_saved_position = true;
+                    config.set_device_position(
+                        ghost.device_name.clone(),
+                        Position { x: ghost.position.x, y: ghost.position.y },
+                    );
+                }
+            }
         }
+        Task::none()
     }
 
     /// Update the filtered nodes based on search query
@@ -384,8 +492,16 @@ impl Graph {
             }
         }
 
-        // Calculate the X offset for connected nodes (shift right if there are isolated nodes)
-        let connected_start_x = if isolated_nodes.is_empty() {
+        // Place ghost nodes below isolated nodes in the same column
+        for ghost in &mut self.ghost_nodes {
+            ghost.position = Point::new(ISOLATED_X, isolated_y);
+            ghost.has_saved_position = false;
+            isolated_y += GHOST_NODE_HEIGHT + ROW_GAP;
+        }
+
+        // Calculate the X offset for connected nodes (shift right if there are isolated nodes or ghosts)
+        let has_left_column = !isolated_nodes.is_empty() || !self.ghost_nodes.is_empty();
+        let connected_start_x = if !has_left_column {
             START_X
         } else {
             START_X + COL_WIDTH + ISOLATED_GAP  // Shift connected graph further right
@@ -812,9 +928,43 @@ impl Graph {
             .fold(min_y, f32::max)
     }
 
-    pub fn handle_pipewire_event(&mut self, event: PipewireEvent, config: &Config) {
+    pub fn handle_pipewire_event(&mut self, event: PipewireEvent, config: &mut Config) {
         match event {
-            PipewireEvent::NodeAdded { id, name, app_name, serial, object_path } => {
+            PipewireEvent::DeviceAdded { id, name, description, api } => {
+                let position = config.get_device_position(&name)
+                    .map(|p| Point::new(p.x, p.y));
+                let has_saved_position = position.is_some();
+
+                self.devices.insert(id, DeviceInfo {
+                    id,
+                    name: name.clone(),
+                    description: description.clone(),
+                    api: api.clone(),
+                    active_node_ids: Vec::new(),
+                });
+
+                // Create ghost node for ALSA devices (only they support profile switching)
+                if api == "alsa" {
+                    let ghost_pos = position.unwrap_or_else(|| layout::auto_position(&self.nodes, id));
+                    self.ghost_nodes.push(GhostNode {
+                        device_id: id,
+                        device_name: name,
+                        display_name: description,
+                        position: ghost_pos,
+                        has_saved_position,
+                    });
+                    self.cache.clear();
+                }
+            }
+            PipewireEvent::DeviceRemoved { id } => {
+                self.devices.remove(&id);
+                self.ghost_nodes.retain(|g| g.device_id != id);
+                if self.profile_picker.as_ref().is_some_and(|p| p.device_id == id) {
+                    self.profile_picker = None;
+                }
+                self.cache.clear();
+            }
+            PipewireEvent::NodeAdded { id, name, app_name, serial, object_path, device_id } => {
                 // Count how many nodes with same name/app/path already exist (for indexing duplicates)
                 let index = self.nodes.values()
                     .filter(|n| n.name == name && n.app_name == app_name && n.object_path == object_path)
@@ -838,6 +988,15 @@ impl Graph {
                 // Offset if another node is already at this position
                 let position = self.find_non_overlapping_position(base_position);
 
+                // Track node in parent device
+                if let Some(dev_id) = device_id {
+                    if let Some(device) = self.devices.get_mut(&dev_id) {
+                        device.active_node_ids.push(id);
+                        // Remove ghost node for this device (device is now active)
+                        self.ghost_nodes.retain(|g| g.device_id != dev_id);
+                    }
+                }
+
                 self.nodes.insert(
                     id,
                     Node {
@@ -853,13 +1012,42 @@ impl Graph {
                         output_ports: Vec::new(),
                         custom_name,
                         source: NodeSource::PipeWire,
+                        device_id,
                     },
                 );
                 self.cache.clear();
             }
             PipewireEvent::NodeRemoved { id } => {
-                self.nodes.remove(&id);
+                // Check if this node belongs to a device - may need to create ghost
+                let removed_node = self.nodes.remove(&id);
                 self.links.retain(|l| l.output_node != id && l.input_node != id);
+
+                if let Some(node) = &removed_node {
+                    if let Some(dev_id) = node.device_id {
+                        if let Some(device) = self.devices.get_mut(&dev_id) {
+                            device.active_node_ids.retain(|&nid| nid != id);
+                            // If device has no more active nodes and is ALSA, create ghost
+                            if device.active_node_ids.is_empty() && device.api == "alsa" {
+                                let ghost_already_exists = self.ghost_nodes.iter().any(|g| g.device_id == dev_id);
+                                if !ghost_already_exists {
+                                    let position = node.position;
+                                    config.set_device_position(
+                                        device.name.clone(),
+                                        Position { x: position.x, y: position.y },
+                                    );
+                                    self.ghost_nodes.push(GhostNode {
+                                        device_id: dev_id,
+                                        device_name: device.name.clone(),
+                                        display_name: device.description.clone(),
+                                        position,
+                                        has_saved_position: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.cache.clear();
             }
             PipewireEvent::PortAdded {
@@ -976,6 +1164,15 @@ impl Graph {
             }
         }
 
+        // Check ghost nodes
+        for (idx, ghost) in self.ghost_nodes.iter().enumerate() {
+            let ghost_height = GHOST_NODE_HEIGHT;
+            let bounds = Rectangle::new(ghost.position, Size::new(NODE_WIDTH, ghost_height));
+            if bounds.contains(world_point) {
+                return HitResult::GhostNode(idx);
+            }
+        }
+
         // Check links (sample points along bezier curve)
         for link in &self.links {
             if let Some(dist) = self.distance_to_link(world_point, link) {
@@ -1061,10 +1258,11 @@ pub enum HitResult {
     Node(u32),
     Port { node_id: u32, port_id: u32 },
     Link { link_id: u32, output_port: u32, input_port: u32 },
+    GhostNode(usize),
 }
 
 impl canvas::Program<Message> for Graph {
-    type State = Interaction;
+    type State = CanvasState;
 
     fn draw(
         &self,
@@ -1128,11 +1326,16 @@ impl canvas::Program<Message> for Graph {
                     && !self.filtered_nodes.contains(&node.id);
                 draw_node(frame, node, dimmed);
             }
+
+            // Draw ghost nodes
+            for ghost in &self.ghost_nodes {
+                draw_ghost_node(frame, ghost);
+            }
         });
 
         // Draw pending connection (not cached - follows cursor)
         let pending = Frame::new(renderer, bounds.size());
-        let pending_geo = if let Interaction::CreatingConnection { from_node, from_port } = *state {
+        let pending_geo = if let InteractionMode::CreatingConnection { from_node, from_port } = state.interaction {
             if let Some(cursor_pos) = cursor.position_in(bounds) {
                 let mut frame = Frame::new(renderer, bounds.size());
                 frame.translate(self.pan_offset);
@@ -1178,7 +1381,17 @@ impl canvas::Program<Message> for Graph {
             Frame::new(renderer, bounds.size()).into_geometry()
         };
 
-        vec![content, pending_geo, help_geo, search_geo]
+        // Profile picker overlay (screen space)
+        let picker_geo = if let Some(ref picker) = self.profile_picker {
+            let mut frame = Frame::new(renderer, bounds.size());
+            let cursor_pos = cursor.position_in(bounds);
+            draw_profile_picker(&mut frame, picker, self.pan_offset, self.zoom, cursor_pos);
+            frame.into_geometry()
+        } else {
+            Frame::new(renderer, bounds.size()).into_geometry()
+        };
+
+        vec![content, pending_geo, help_geo, search_geo, picker_geo]
     }
 
     fn update(
@@ -1193,27 +1406,75 @@ impl canvas::Program<Message> for Graph {
         match event {
             iced::Event::Mouse(mouse_event) => match mouse_event {
                 mouse::Event::ButtonPressed(mouse::Button::Left) => {
+                    // If profile picker is open, handle clicks on it first
+                    if let Some(ref picker) = self.profile_picker {
+                        if let Some(profile_idx) = hit_test_profile_picker(cursor_position, picker, self.pan_offset, self.zoom) {
+                            let profile = &picker.profiles[profile_idx];
+                            return Some(canvas::Action::publish(Message::Graph(
+                                GraphMessage::ActivateDeviceProfile {
+                                    device_id: picker.device_id,
+                                    device_name: picker.device_name.clone(),
+                                    profile_index: profile.index,
+                                }
+                            )));
+                        } else {
+                            // Click outside picker dismisses it
+                            return Some(canvas::Action::publish(Message::Graph(
+                                GraphMessage::DismissProfilePicker
+                            )));
+                        }
+                    }
+
                     let hit = self.hit_test(cursor_position);
                     match hit {
                         HitResult::Port { node_id, port_id } => {
-                            *state = Interaction::CreatingConnection { from_node: node_id, from_port: port_id };
+                            state.interaction = InteractionMode::CreatingConnection { from_node: node_id, from_port: port_id };
                             Some(canvas::Action::publish(Message::Graph(
                                 GraphMessage::ConnectionStarted { node_id, port_id }
                             )))
                         }
                         HitResult::Node(node_id) => {
-                            *state = Interaction::Dragging { node_id, last_pos: cursor_position };
+                            state.interaction = InteractionMode::Dragging { node_id, last_pos: cursor_position };
+                            Some(canvas::Action::request_redraw())
+                        }
+                        HitResult::GhostNode(idx) => {
+                            state.interaction = InteractionMode::DraggingGhost { ghost_index: idx, last_pos: cursor_position };
                             Some(canvas::Action::request_redraw())
                         }
                         HitResult::Link { .. } | HitResult::None => {
-                            *state = Interaction::Panning { last_pos: cursor_position };
+                            state.interaction = InteractionMode::Panning { last_pos: cursor_position };
                             Some(canvas::Action::request_redraw())
                         }
                     }
                 }
                 mouse::Event::ButtonPressed(mouse::Button::Right) => {
                     let hit = self.hit_test(cursor_position);
-                    if let HitResult::Link { link_id, output_port, input_port } = hit {
+                    if state.ctrl_held {
+                        match hit {
+                            HitResult::Node(node_id) => {
+                                if let Some(node) = self.nodes.get(&node_id) {
+                                    if let Some(device_id) = node.device_id {
+                                        // Only allow deactivation for ALSA devices (they support profiles)
+                                        let is_alsa = self.devices.get(&device_id)
+                                            .map(|d| d.api == "alsa")
+                                            .unwrap_or(false);
+                                        if is_alsa {
+                                            return Some(canvas::Action::publish(Message::Graph(
+                                                GraphMessage::DeactivateDevice { device_id }
+                                            )));
+                                        }
+                                    }
+                                }
+                                None
+                            }
+                            HitResult::GhostNode(idx) => {
+                                Some(canvas::Action::publish(Message::Graph(
+                                    GraphMessage::ShowProfilePicker { ghost_index: idx }
+                                )))
+                            }
+                            _ => None,
+                        }
+                    } else if let HitResult::Link { link_id, output_port, input_port } = hit {
                         Some(canvas::Action::publish(Message::Graph(
                             GraphMessage::DisconnectLink { link_id, output_port, input_port }
                         )))
@@ -1222,13 +1483,13 @@ impl canvas::Program<Message> for Graph {
                     }
                 }
                 mouse::Event::ButtonReleased(mouse::Button::Left) => {
-                    let action = match *state {
-                        Interaction::Dragging { node_id, .. } => {
+                    let action = match state.interaction {
+                        InteractionMode::Dragging { node_id, .. } => {
                             Some(canvas::Action::publish(Message::Graph(
                                 GraphMessage::NodeDragEnded { node_id }
                             )))
                         }
-                        Interaction::CreatingConnection { from_node, from_port } => {
+                        InteractionMode::CreatingConnection { from_node, from_port } => {
                             let hit = self.hit_test(cursor_position);
                             if let HitResult::Port { node_id, port_id } = hit {
                                 Some(canvas::Action::publish(Message::Graph(
@@ -1245,38 +1506,60 @@ impl canvas::Program<Message> for Graph {
                                 )))
                             }
                         }
+                        InteractionMode::DraggingGhost { ghost_index, .. } => {
+                            Some(canvas::Action::publish(Message::Graph(
+                                GraphMessage::GhostDragEnded { ghost_index }
+                            )))
+                        }
                         _ => Some(canvas::Action::request_redraw()),
                     };
-                    *state = Interaction::None;
+                    state.interaction = InteractionMode::None;
                     action
                 }
                 mouse::Event::CursorMoved { .. } => {
-                    match *state {
-                        Interaction::Dragging { node_id, last_pos } => {
+                    match state.interaction {
+                        InteractionMode::Dragging { node_id, last_pos } => {
                             let delta = Vector::new(
                                 cursor_position.x - last_pos.x,
                                 cursor_position.y - last_pos.y,
                             );
-                            *state = Interaction::Dragging { node_id, last_pos: cursor_position };
+                            state.interaction = InteractionMode::Dragging { node_id, last_pos: cursor_position };
                             Some(canvas::Action::publish(Message::Graph(
                                 GraphMessage::NodeDragged { node_id, delta }
                             )))
                         }
-                        Interaction::Panning { last_pos } => {
+                        InteractionMode::Panning { last_pos } => {
                             let delta = Vector::new(
                                 cursor_position.x - last_pos.x,
                                 cursor_position.y - last_pos.y,
                             );
-                            *state = Interaction::Panning { last_pos: cursor_position };
+                            state.interaction = InteractionMode::Panning { last_pos: cursor_position };
                             Some(canvas::Action::publish(Message::Graph(
                                 GraphMessage::Pan(delta)
                             )))
                         }
-                        Interaction::CreatingConnection { .. } => {
+                        InteractionMode::CreatingConnection { .. } => {
                             // Request redraw to update the pending connection line
                             Some(canvas::Action::request_redraw())
                         }
-                        _ => None,
+                        InteractionMode::DraggingGhost { ghost_index, last_pos } => {
+                            let delta = Vector::new(
+                                cursor_position.x - last_pos.x,
+                                cursor_position.y - last_pos.y,
+                            );
+                            state.interaction = InteractionMode::DraggingGhost { ghost_index, last_pos: cursor_position };
+                            Some(canvas::Action::publish(Message::Graph(
+                                GraphMessage::GhostDragged { ghost_index, delta }
+                            )))
+                        }
+                        _ => {
+                            // Redraw for hover effects when picker is open
+                            if self.profile_picker.is_some() {
+                                Some(canvas::Action::request_redraw())
+                            } else {
+                                None
+                            }
+                        }
                     }
                 }
                 mouse::Event::WheelScrolled { delta } => {
@@ -1292,6 +1575,9 @@ impl canvas::Program<Message> for Graph {
             },
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
                 use iced::keyboard::Key;
+
+                // Track ctrl state
+                state.ctrl_held = modifiers.control();
 
                 // When search is active, handle typing
                 if self.search_active {
@@ -1325,6 +1611,15 @@ impl canvas::Program<Message> for Graph {
 
                 // Normal keyboard handling
                 match key.as_ref() {
+                    Key::Named(iced::keyboard::key::Named::Escape) => {
+                        if self.profile_picker.is_some() {
+                            Some(canvas::Action::publish(Message::Graph(GraphMessage::DismissProfilePicker)))
+                        } else if self.show_help {
+                            Some(canvas::Action::publish(Message::Graph(GraphMessage::ToggleHelp)))
+                        } else {
+                            None
+                        }
+                    }
                     // Ctrl+F or / to activate search
                     Key::Character("f") | Key::Character("F") if modifiers.control() => {
                         Some(canvas::Action::publish(Message::Graph(GraphMessage::SearchActivate)))
@@ -1347,17 +1642,17 @@ impl canvas::Program<Message> for Graph {
                     Key::Character("?") | Key::Named(iced::keyboard::key::Named::F1) => {
                         Some(canvas::Action::publish(Message::Graph(GraphMessage::ToggleHelp)))
                     }
-                    Key::Named(iced::keyboard::key::Named::Escape) => {
-                        // Escape closes help if open
-                        if self.show_help {
-                            Some(canvas::Action::publish(Message::Graph(GraphMessage::ToggleHelp)))
-                        } else {
-                            None
-                        }
-                    }
                     _ => None,
                 }
             },
+            iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { modifiers, .. }) => {
+                state.ctrl_held = modifiers.control();
+                None
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.ctrl_held = modifiers.control();
+                None
+            }
             _ => None,
         }
     }
@@ -1369,14 +1664,14 @@ impl canvas::Program<Message> for Graph {
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
         if cursor.is_over(bounds) {
-            match state {
-                Interaction::Dragging { .. } => mouse::Interaction::Grabbing,
-                Interaction::Panning { .. } => mouse::Interaction::Grabbing,
-                Interaction::CreatingConnection { .. } => mouse::Interaction::Crosshair,
-                Interaction::None => {
+            match state.interaction {
+                InteractionMode::Dragging { .. } | InteractionMode::DraggingGhost { .. } => mouse::Interaction::Grabbing,
+                InteractionMode::Panning { .. } => mouse::Interaction::Grabbing,
+                InteractionMode::CreatingConnection { .. } => mouse::Interaction::Crosshair,
+                InteractionMode::None => {
                     if let Some(pos) = cursor.position_in(bounds) {
                         match self.hit_test(pos) {
-                            HitResult::Node(_) => mouse::Interaction::Grab,
+                            HitResult::Node(_) | HitResult::GhostNode(_) => mouse::Interaction::Grab,
                             HitResult::Port { .. } => mouse::Interaction::Crosshair,
                             HitResult::Link { .. } => mouse::Interaction::Pointer,
                             HitResult::None => mouse::Interaction::default(),
@@ -1392,13 +1687,28 @@ impl canvas::Program<Message> for Graph {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub enum Interaction {
-    #[default]
+#[derive(Debug, Clone, Copy)]
+pub enum InteractionMode {
     None,
     Dragging { node_id: u32, last_pos: Point },
     Panning { last_pos: Point },
     CreatingConnection { from_node: u32, from_port: u32 },
+    DraggingGhost { ghost_index: usize, last_pos: Point },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CanvasState {
+    pub interaction: InteractionMode,
+    pub ctrl_held: bool,
+}
+
+impl Default for CanvasState {
+    fn default() -> Self {
+        Self {
+            interaction: InteractionMode::None,
+            ctrl_held: false,
+        }
+    }
 }
 
 // Color palette - Midnight Studio aesthetic
@@ -1748,6 +2058,8 @@ fn draw_help_overlay(frame: &mut Frame, size: Size) {
         ("Drag node", "Move"),
         ("Drag empty", "Pan"),
         ("Scroll", "Zoom"),
+        ("Ctrl+Right node", "Deactivate device"),
+        ("Ctrl+Right ghost", "Activate device"),
     ];
 
     let box_width = 280.0;
@@ -1904,4 +2216,286 @@ fn draw_search_overlay(frame: &mut Frame, size: Size, query: &str, match_count: 
         ..Text::default()
     };
     frame.fill_text(hint);
+}
+
+fn draw_ghost_node(frame: &mut Frame, ghost: &GhostNode) {
+    let height = GHOST_NODE_HEIGHT;
+    let corner_radius = 8.0;
+    let opacity = 0.35;
+
+    let dim = |c: Color| -> Color {
+        Color::from_rgba(c.r, c.g, c.b, c.a * opacity)
+    };
+
+    // Node background
+    draw_rounded_rect(
+        frame,
+        ghost.position,
+        Size::new(NODE_WIDTH, height),
+        corner_radius,
+        dim(palette::NODE_BG),
+    );
+
+    // Header background
+    let header_path = Path::new(|builder| {
+        let r = corner_radius;
+        let x = ghost.position.x;
+        let y = ghost.position.y;
+        let w = NODE_WIDTH;
+        let h = NODE_HEADER_HEIGHT;
+
+        builder.move_to(Point::new(x + r, y));
+        builder.line_to(Point::new(x + w - r, y));
+        builder.arc_to(Point::new(x + w, y), Point::new(x + w, y + r), r);
+        builder.line_to(Point::new(x + w, y + h));
+        builder.line_to(Point::new(x, y + h));
+        builder.line_to(Point::new(x, y + r));
+        builder.arc_to(Point::new(x, y), Point::new(x + r, y), r);
+        builder.close();
+    });
+    frame.fill(&header_path, dim(palette::NODE_HEADER));
+
+    // Dashed border in muted purple
+    let border_color = Color::from_rgba(0.55, 0.40, 0.70, opacity);
+    // Draw dashed border segments
+    let x = ghost.position.x;
+    let y = ghost.position.y;
+    let w = NODE_WIDTH;
+    let h = height;
+    let dash_len = 6.0;
+    let gap_len = 4.0;
+
+    // Top edge
+    draw_dashed_line(frame, Point::new(x, y), Point::new(x + w, y), dash_len, gap_len, border_color, 1.0);
+    // Bottom edge
+    draw_dashed_line(frame, Point::new(x, y + h), Point::new(x + w, y + h), dash_len, gap_len, border_color, 1.0);
+    // Left edge
+    draw_dashed_line(frame, Point::new(x, y), Point::new(x, y + h), dash_len, gap_len, border_color, 1.0);
+    // Right edge
+    draw_dashed_line(frame, Point::new(x + w, y), Point::new(x + w, y + h), dash_len, gap_len, border_color, 1.0);
+
+    // Red power-off indicator dot
+    let dot_pos = Point::new(ghost.position.x + 12.0, ghost.position.y + NODE_HEADER_HEIGHT / 2.0);
+    let dot = Path::circle(dot_pos, 4.0);
+    frame.fill(&dot, Color::from_rgba(0.85, 0.25, 0.25, opacity));
+
+    // Device name as title
+    let max_chars = 20;
+    let display_name = if ghost.display_name.len() > max_chars {
+        format!("{}...", &ghost.display_name[..max_chars - 3])
+    } else {
+        ghost.display_name.clone()
+    };
+    let title = Text {
+        content: display_name,
+        position: Point::new(ghost.position.x + 22.0, ghost.position.y + 7.0),
+        color: Color::from_rgba(0.92, 0.92, 0.94, opacity),
+        size: iced::Pixels(12.0),
+        ..Text::default()
+    };
+    frame.fill_text(title);
+
+    // Hint text
+    let hint = Text {
+        content: "Ctrl+Right-click to activate".to_string(),
+        position: Point::new(ghost.position.x + 10.0, ghost.position.y + NODE_HEADER_HEIGHT + 6.0),
+        color: Color::from_rgba(0.55, 0.55, 0.60, opacity),
+        size: iced::Pixels(9.0),
+        ..Text::default()
+    };
+    frame.fill_text(hint);
+}
+
+fn draw_dashed_line(frame: &mut Frame, start: Point, end: Point, dash: f32, gap: f32, color: Color, width: f32) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 0.01 {
+        return;
+    }
+    let ux = dx / length;
+    let uy = dy / length;
+    let mut dist = 0.0;
+    while dist < length {
+        let seg_end = (dist + dash).min(length);
+        let p0 = Point::new(start.x + ux * dist, start.y + uy * dist);
+        let p1 = Point::new(start.x + ux * seg_end, start.y + uy * seg_end);
+        let path = Path::line(p0, p1);
+        frame.stroke(&path, Stroke::default().with_color(color).with_width(width));
+        dist += dash + gap;
+    }
+}
+
+const PICKER_ITEM_HEIGHT: f32 = 32.0;
+const PICKER_HEADER_HEIGHT: f32 = 36.0;
+const PICKER_PADDING: f32 = 6.0;
+
+fn picker_width(picker: &ProfilePickerState) -> f32 {
+    // Size to fit longest profile description, with a reasonable min/max
+    let max_desc = picker.profiles.iter()
+        .map(|p| p.description.len())
+        .max()
+        .unwrap_or(20);
+    // ~6.5px per char at 11px font, plus padding for "last" marker
+    (max_desc as f32 * 6.5 + 70.0).clamp(240.0, 420.0)
+}
+
+fn picker_screen_rect(picker: &ProfilePickerState, pan_offset: Vector, zoom: f32) -> (f32, f32, f32, f32) {
+    let box_w = picker_width(picker);
+    let screen_x = picker.position.x * zoom + pan_offset.x;
+    let screen_y = picker.position.y * zoom + pan_offset.y + GHOST_NODE_HEIGHT * zoom + 4.0;
+    let item_count = if picker.profiles.is_empty() { 1 } else { picker.profiles.len() };
+    let total_height = PICKER_HEADER_HEIGHT + item_count as f32 * PICKER_ITEM_HEIGHT + PICKER_PADDING * 2.0;
+    (screen_x, screen_y, box_w, total_height)
+}
+
+fn draw_profile_picker(frame: &mut Frame, picker: &ProfilePickerState, pan_offset: Vector, zoom: f32, cursor: Option<Point>) {
+    let (box_x, box_y, box_w, box_h) = picker_screen_rect(picker, pan_offset, zoom);
+
+    // Determine which item the cursor is hovering
+    let hovered_index = cursor.and_then(|c| {
+        if picker.profiles.is_empty() { return None; }
+        for (i, _) in picker.profiles.iter().enumerate() {
+            let item_y = box_y + PICKER_HEADER_HEIGHT + PICKER_PADDING + i as f32 * PICKER_ITEM_HEIGHT;
+            let item_rect = Rectangle::new(
+                Point::new(box_x, item_y),
+                Size::new(box_w, PICKER_ITEM_HEIGHT),
+            );
+            if item_rect.contains(c) {
+                return Some(i);
+            }
+        }
+        None
+    });
+
+    // Opaque blocker — plain rectangle to fully occlude anything behind the picker
+    frame.fill_rectangle(
+        Point::new(box_x - 4.0, box_y - 4.0),
+        Size::new(box_w + 8.0, box_h + 8.0),
+        Color::from_rgb(0.075, 0.075, 0.085),
+    );
+
+    // Background - match node bg
+    draw_rounded_rect(
+        frame,
+        Point::new(box_x, box_y),
+        Size::new(box_w, box_h),
+        8.0,
+        Color::from_rgb(0.11, 0.11, 0.13),
+    );
+
+    // Subtle border - same as node border, not purple
+    stroke_rounded_rect(
+        frame,
+        Point::new(box_x, box_y),
+        Size::new(box_w, box_h),
+        8.0,
+        Color::from_rgb(0.25, 0.25, 0.30),
+        1.0,
+    );
+
+    // Header
+    let header = Text {
+        content: "Select Profile".to_string(),
+        position: Point::new(box_x + 12.0, box_y + 11.0),
+        color: palette::TEXT_SECONDARY,
+        size: iced::Pixels(11.0),
+        ..Text::default()
+    };
+    frame.fill_text(header);
+
+    // Separator line under header
+    let sep = Path::line(
+        Point::new(box_x + 8.0, box_y + PICKER_HEADER_HEIGHT),
+        Point::new(box_x + box_w - 8.0, box_y + PICKER_HEADER_HEIGHT),
+    );
+    frame.stroke(&sep, Stroke::default()
+        .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.06))
+        .with_width(1.0));
+
+    if picker.profiles.is_empty() {
+        let loading = Text {
+            content: "Loading profiles...".to_string(),
+            position: Point::new(box_x + 12.0, box_y + PICKER_HEADER_HEIGHT + 10.0),
+            color: palette::TEXT_SECONDARY,
+            size: iced::Pixels(11.0),
+            ..Text::default()
+        };
+        frame.fill_text(loading);
+    } else {
+        for (i, profile) in picker.profiles.iter().enumerate() {
+            let item_y = box_y + PICKER_HEADER_HEIGHT + PICKER_PADDING + i as f32 * PICKER_ITEM_HEIGHT;
+            let is_last_used = picker.last_used_index == Some(profile.index);
+            let is_hovered = hovered_index == Some(i);
+
+            // Hover highlight
+            if is_hovered {
+                draw_rounded_rect(
+                    frame,
+                    Point::new(box_x + 4.0, item_y + 1.0),
+                    Size::new(box_w - 8.0, PICKER_ITEM_HEIGHT - 2.0),
+                    4.0,
+                    Color::from_rgba(1.0, 1.0, 1.0, 0.07),
+                );
+            }
+
+            // Last-used highlight (stacks with hover)
+            if is_last_used {
+                draw_rounded_rect(
+                    frame,
+                    Point::new(box_x + 4.0, item_y + 1.0),
+                    Size::new(box_w - 8.0, PICKER_ITEM_HEIGHT - 2.0),
+                    4.0,
+                    Color::from_rgba(0.30, 0.75, 0.85, 0.08),
+                );
+            }
+
+            let text_color = if is_hovered {
+                Color::WHITE
+            } else if is_last_used {
+                palette::ACCENT_INPUT
+            } else {
+                palette::TEXT_PRIMARY
+            };
+
+            let item_text = Text {
+                content: profile.description.clone(),
+                position: Point::new(box_x + 12.0, item_y + 9.0),
+                color: text_color,
+                size: iced::Pixels(11.5),
+                ..Text::default()
+            };
+            frame.fill_text(item_text);
+
+            // Small dot marker for last-used
+            if is_last_used {
+                let dot = Path::circle(
+                    Point::new(box_x + box_w - 14.0, item_y + PICKER_ITEM_HEIGHT / 2.0),
+                    3.0,
+                );
+                frame.fill(&dot, Color::from_rgba(0.30, 0.75, 0.85, 0.5));
+            }
+        }
+    }
+}
+
+fn hit_test_profile_picker(cursor: Point, picker: &ProfilePickerState, pan_offset: Vector, zoom: f32) -> Option<usize> {
+    if picker.profiles.is_empty() {
+        return None;
+    }
+
+    let (box_x, box_y, box_w, _box_h) = picker_screen_rect(picker, pan_offset, zoom);
+
+    for (i, _profile) in picker.profiles.iter().enumerate() {
+        let item_y = box_y + PICKER_HEADER_HEIGHT + PICKER_PADDING + i as f32 * PICKER_ITEM_HEIGHT;
+        let item_rect = Rectangle::new(
+            Point::new(box_x, item_y),
+            Size::new(box_w, PICKER_ITEM_HEIGHT),
+        );
+        if item_rect.contains(cursor) {
+            return Some(i);
+        }
+    }
+
+    None
 }

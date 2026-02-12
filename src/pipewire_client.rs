@@ -5,7 +5,7 @@ use pipewire::context::ContextBox;
 use pipewire::main_loop::MainLoopBox;
 use pipewire as pw;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::graph::{PortDirection, PortType};
@@ -18,6 +18,7 @@ pub enum PipewireEvent {
         app_name: Option<String>,
         serial: Option<String>,
         object_path: Option<String>,
+        device_id: Option<u32>,
     },
     NodeRemoved {
         id: u32,
@@ -41,6 +42,15 @@ pub enum PipewireEvent {
         input_port: u32,
     },
     LinkRemoved {
+        id: u32,
+    },
+    DeviceAdded {
+        id: u32,
+        name: String,
+        description: String,
+        api: String,
+    },
+    DeviceRemoved {
         id: u32,
     },
 }
@@ -70,8 +80,11 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
     let core = context.connect(None)?;
     let registry = core.get_registry()?;
 
-    // Track port -> node mapping
+    // Track object types for correct removal
     let port_to_node: Rc<RefCell<HashMap<u32, u32>>> = Rc::new(RefCell::new(HashMap::new()));
+    let node_ids: Rc<RefCell<HashSet<u32>>> = Rc::new(RefCell::new(HashSet::new()));
+    let link_ids: Rc<RefCell<HashSet<u32>>> = Rc::new(RefCell::new(HashSet::new()));
+    let device_ids: Rc<RefCell<HashSet<u32>>> = Rc::new(RefCell::new(HashSet::new()));
     let tx = Rc::new(RefCell::new(tx));
 
     let _listener = registry
@@ -79,9 +92,38 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
         .global({
             let tx = tx.clone();
             let port_to_node = port_to_node.clone();
+            let node_ids = node_ids.clone();
+            let link_ids = link_ids.clone();
+            let device_ids = device_ids.clone();
             move |global| {
                 let mut tx = tx.borrow_mut();
                 match global.type_ {
+                    pw::types::ObjectType::Device => {
+                        let props = global.props.as_ref();
+                        let name = props
+                            .and_then(|p| p.get("device.name"))
+                            .unwrap_or("Unknown")
+                            .to_string();
+                        let description = props
+                            .and_then(|p| p.get("device.description"))
+                            .or_else(|| props.and_then(|p| p.get("device.nick")))
+                            .or_else(|| props.and_then(|p| p.get("device.name")))
+                            .unwrap_or("Unknown")
+                            .to_string();
+                        let api = props
+                            .and_then(|p| p.get("device.api"))
+                            .unwrap_or("")
+                            .to_string();
+
+                        device_ids.borrow_mut().insert(global.id);
+
+                        let _ = tx.try_send(PipewireEvent::DeviceAdded {
+                            id: global.id,
+                            name,
+                            description,
+                            api,
+                        });
+                    }
                     pw::types::ObjectType::Node => {
                         let props = global.props.as_ref();
                         let name = props
@@ -99,6 +141,11 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
                         let object_path = props
                             .and_then(|p| p.get("object.path"))
                             .map(String::from);
+                        let device_id = props
+                            .and_then(|p| p.get("device.id"))
+                            .and_then(|s| s.parse().ok());
+
+                        node_ids.borrow_mut().insert(global.id);
 
                         let _ = tx.try_send(PipewireEvent::NodeAdded {
                             id: global.id,
@@ -106,6 +153,7 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
                             app_name,
                             serial,
                             object_path,
+                            device_id,
                         });
                     }
                     pw::types::ObjectType::Port => {
@@ -139,7 +187,14 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
                                     PortType::Audio
                                 }
                             })
-                            .unwrap_or(PortType::Audio);
+                            .unwrap_or_else(|| {
+                                // Detect video ports by object.path (V4L2 devices have no format.dsp)
+                                let is_video = props
+                                    .and_then(|p| p.get("object.path"))
+                                    .map(|p| p.starts_with("v4l2:"))
+                                    .unwrap_or(false);
+                                if is_video { PortType::Video } else { PortType::Audio }
+                            });
 
                         port_to_node.borrow_mut().insert(global.id, node_id);
 
@@ -170,6 +225,8 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(0);
 
+                        link_ids.borrow_mut().insert(global.id);
+
                         let _ = tx.try_send(PipewireEvent::LinkAdded {
                             id: global.id,
                             output_node,
@@ -185,6 +242,9 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
         .global_remove({
             let tx = tx.clone();
             let port_to_node = port_to_node.clone();
+            let node_ids = node_ids.clone();
+            let link_ids = link_ids.clone();
+            let device_ids = device_ids.clone();
             move |id| {
                 let mut tx = tx.borrow_mut();
                 if let Some(node_id) = port_to_node.borrow_mut().remove(&id) {
@@ -192,9 +252,12 @@ fn run_pipewire_loop(tx: mpsc::Sender<PipewireEvent>) -> Result<(), pw::Error> {
                         node_id,
                         port_id: id,
                     });
-                } else {
+                } else if node_ids.borrow_mut().remove(&id) {
                     let _ = tx.try_send(PipewireEvent::NodeRemoved { id });
+                } else if link_ids.borrow_mut().remove(&id) {
                     let _ = tx.try_send(PipewireEvent::LinkRemoved { id });
+                } else if device_ids.borrow_mut().remove(&id) {
+                    let _ = tx.try_send(PipewireEvent::DeviceRemoved { id });
                 }
             }
         })

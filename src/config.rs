@@ -28,6 +28,14 @@ pub struct Config {
     /// Whether ALSA MIDI is enabled
     #[serde(default)]
     pub alsa_midi_enabled: bool,
+
+    /// Last-used profile index per device (device.name → profile index)
+    #[serde(default)]
+    pub device_profiles: HashMap<String, u32>,
+
+    /// Saved ghost node positions per device (device.name → position)
+    #[serde(default)]
+    pub device_positions: HashMap<String, Position>,
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -112,5 +120,27 @@ impl Config {
     pub fn presets_dir() -> Option<PathBuf> {
         let dirs = ProjectDirs::from("", "", "solder")?;
         Some(dirs.config_dir().join("presets"))
+    }
+
+    /// Get last-used profile index for a device
+    pub fn get_device_profile(&self, device_name: &str) -> Option<u32> {
+        self.device_profiles.get(device_name).copied()
+    }
+
+    /// Set last-used profile index for a device
+    pub fn set_device_profile(&mut self, device_name: String, profile_index: u32) {
+        self.device_profiles.insert(device_name, profile_index);
+        let _ = self.save();
+    }
+
+    /// Get saved ghost node position for a device
+    pub fn get_device_position(&self, device_name: &str) -> Option<Position> {
+        self.device_positions.get(device_name).copied()
+    }
+
+    /// Set ghost node position for a device
+    pub fn set_device_position(&mut self, device_name: String, pos: Position) {
+        self.device_positions.insert(device_name, pos);
+        let _ = self.save();
     }
 }
